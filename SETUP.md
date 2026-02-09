@@ -40,7 +40,7 @@ progress_viewer --help
 # Run basic test
 cd test_basic
 db_util import test.db test_jobs.csv
-job_scheduler test.db test_script.sh --max-runtime 60
+job_scheduler test.db "bash test_script.sh" --max-runtime 60
 
 # Check results
 progress_viewer test.db
@@ -75,7 +75,7 @@ cat > test_job.sh << 'EOJ'
 
 source $HOME/.bashrc
 cd /path/to/job-runner-v2/test_basic
-job_scheduler test.db test_script.sh --max-runtime 180
+job_scheduler test.db "bash test_script.sh" --max-runtime 180
 EOJ
 
 miqsub test_job.sh

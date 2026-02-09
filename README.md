@@ -24,7 +24,7 @@ SQLite-based parallel job scheduler for HPC environments (TSUBAME, etc.)
 db_util import jobs.db input.csv
 
 # 2. Run jobs
-job_scheduler jobs.db run.sh
+job_scheduler jobs.db "bash run.sh"
 
 # 3. Monitor progress
 progress_viewer jobs.db --watch

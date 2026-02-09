@@ -43,12 +43,12 @@ print(f"Processing: {args.param1}, {args.param2}")
 
 **シングルノード（1プロセス）**:
 ```bash
-job_scheduler jobs.db run.sh
+job_scheduler jobs.db "bash run.sh"
 ```
 
 **シングルノード（4並列）**:
 ```bash
-job_scheduler jobs.db run.sh --parallel 4
+job_scheduler jobs.db "bash run.sh" --parallel 4
 ```
 
 **複数ノード（qsub）**:
@@ -129,7 +129,7 @@ low_priority,1,2.0
 
 ```bash
 # 24時間以内に終わらせる、最後の5分は余裕を持つ
-job_scheduler jobs.db run.sh \
+job_scheduler jobs.db "bash run.sh" \
     --max-runtime 86400 \
     --margin-time 300
 ```
@@ -144,7 +144,7 @@ db_util export jobs.db failed.csv --status error
 db_util import retry.db failed.csv
 
 # 3. 再実行
-job_scheduler retry.db run.sh
+job_scheduler retry.db "bash run.sh"
 ```
 
 ## トラブルシューティング
@@ -186,5 +186,4 @@ python3 -c "import sqlite3; conn = sqlite3.connect('jobs.db'); print('OK')"
 ## 次のステップ
 
 - [README.md](README.md) / [README_ja.md](README_ja.md) - 詳細なドキュメント
-- [README_TEST.md](README_TEST.md) - テストガイド
 - [SETUP.md](SETUP.md) - インストールとセットアップ

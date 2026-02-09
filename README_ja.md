@@ -36,7 +36,7 @@ db_util import jobs.db input.csv
 
 ```bash
 # 位置引数で実行（シェルスクリプト）
-job_scheduler jobs.db run.sh
+job_scheduler jobs.db "bash run.sh"
 
 # 名前付き引数で実行（Pythonスクリプト）
 job_scheduler jobs.db "python run.py" --named-args
@@ -71,13 +71,13 @@ echo 'export PATH="/path/to/job-runner-v2/script:$PATH"' >> ~/.bashrc
 
 ```bash
 # シングルノードで実行
-job_scheduler jobs.db run.sh
+job_scheduler jobs.db "bash run.sh"
 
 # 並列実行（1ノード内で4並列）
-job_scheduler jobs.db run.sh --parallel 4
+job_scheduler jobs.db "bash run.sh" --parallel 4
 
 # 時間制約付き（24時間以内、最後5分はマージン）
-job_scheduler jobs.db run.sh \
+job_scheduler jobs.db "bash run.sh" \
     --max-runtime 86400 \
     --margin-time 300
 ```
@@ -199,7 +199,7 @@ job_scheduler <db_file> <command> [options]
 
 ```bash
 # スケジューラを再起動すると自動的にpendingに戻ります
-job_scheduler jobs.db run.sh
+job_scheduler jobs.db "bash run.sh"
 
 # または手動でリセット
 db_util reset jobs.db
@@ -213,7 +213,7 @@ db_util stats jobs.db
 
 # estimate_timeが大きすぎて残り時間内に収まらない場合
 # → smart-schedulingを無効化
-job_scheduler jobs.db run.sh --smart-scheduling false
+job_scheduler jobs.db "bash run.sh" --smart-scheduling false
 ```
 
 ### Q: データベースロックエラー

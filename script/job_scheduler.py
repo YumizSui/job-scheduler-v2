@@ -201,10 +201,6 @@ class JobScheduler:
         # Parse command
         cmd = self.command.split()
 
-        # Auto-add bash for .sh files if not already specified
-        if len(cmd) == 1 and cmd[0].endswith('.sh') and not cmd[0].startswith('bash'):
-            cmd = ['bash'] + cmd
-
         # Get user columns (exclude reserved columns)
         reserved = {
             'JOBSCHEDULER_JOB_ID', 'JOBSCHEDULER_STATUS', 'JOBSCHEDULER_PRIORITY',
