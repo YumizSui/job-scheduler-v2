@@ -13,7 +13,13 @@
 ```bash
 git clone <your-repository-url>
 cd job-runner-v2
-chmod +x job_scheduler db_util.py progress_viewer.py
+chmod +x script/job_scheduler script/db_util.py script/progress_viewer.py
+
+# Add to PATH
+export PATH="$(pwd)/script:$PATH"
+
+# To make permanent, add to ~/.bashrc
+echo 'export PATH="/path/to/job-runner-v2/script:$PATH"' >> ~/.bashrc
 ```
 
 ### Verify Installation
@@ -42,11 +48,11 @@ progress_viewer test.db
 
 ## Configuration for TSUBAME/HPC
 
-### 1. Add to PATH (Optional)
+### 1. Add to PATH (Required)
 
 ```bash
 # Add to ~/.bashrc
-export PATH="/path/to/job-runner-v2:$PATH"
+export PATH="/path/to/job-runner-v2/script:$PATH"
 ```
 
 ### 2. Create alias for miqsub (TSUBAME)
@@ -80,10 +86,10 @@ miqsub test_job.sh
 ### Permission Denied
 
 ```bash
-chmod +x job_scheduler db_util.py progress_viewer.py
-chmod +x test_basic/*.sh
-chmod +x test_production/*.sh
-chmod +x test_stress/*.sh
+chmod +x script/job_scheduler script/db_util.py script/progress_viewer.py
+chmod +x tests/basic/*.sh
+chmod +x tests/production/*.sh
+chmod +x tests/stress/*.sh
 ```
 
 ### Python Not Found
@@ -93,7 +99,7 @@ chmod +x test_stress/*.sh
 which python3
 
 # Ensure scripts are in PATH
-export PATH="/path/to/job-runner-v2:$PATH"
+export PATH="/path/to/job-runner-v2/script:$PATH"
 job_scheduler --help
 ```
 

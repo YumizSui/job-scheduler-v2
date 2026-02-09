@@ -56,7 +56,13 @@ progress_viewer jobs.db --watch
 ```bash
 git clone <repository>
 cd job-runner-v2
-chmod +x job_scheduler db_util.py progress_viewer.py
+chmod +x script/job_scheduler script/db_util.py script/progress_viewer.py
+
+# パスを通す
+export PATH="$(pwd)/script:$PATH"
+
+# 永続化する場合は ~/.bashrc に追加
+echo 'export PATH="/path/to/job-runner-v2/script:$PATH"' >> ~/.bashrc
 ```
 
 ## 使い方
@@ -88,7 +94,7 @@ job_scheduler jobs.db run.sh \
 
 source $HOME/.bashrc
 
-/path/to/job_scheduler /path/to/jobs.db "bash run.sh" \
+job_scheduler /path/to/jobs.db "bash run.sh" \
     --max-runtime 86000 \
     --margin-time 300
 ```

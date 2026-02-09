@@ -61,7 +61,7 @@ job_scheduler jobs.db run.sh --parallel 4
 #$ -l h_rt=24:00:00
 
 source $HOME/.bashrc
-/path/to/job_scheduler /path/to/jobs.db "bash run.sh" \
+job_scheduler /path/to/jobs.db "bash run.sh" \
     --max-runtime 86000 \
     --margin-time 300
 ```

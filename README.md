@@ -35,7 +35,13 @@ progress_viewer jobs.db --watch
 ```bash
 git clone https://github.com/your-username/job-runner-v2.git
 cd job-runner-v2
-chmod +x job_scheduler db_util.py progress_viewer.py
+chmod +x script/job_scheduler script/db_util.py script/progress_viewer.py
+
+# Add to PATH
+export PATH="$(pwd)/script:$PATH"
+
+# To make permanent, add to ~/.bashrc
+echo 'export PATH="/path/to/job-runner-v2/script:$PATH"' >> ~/.bashrc
 ```
 
 No external dependencies required! (Python 3.6+ standard library only)
