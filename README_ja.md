@@ -227,78 +227,12 @@ job_scheduler jobs.db run.sh --smart-scheduling false
 - ジョブが軽すぎる（<1秒）場合はオーバーヘッドの影響が大きい
 - 推奨：1ノード内は2-4並列程度、それ以上は複数ノード投入を推奨
 
-## テスト
-
-### 基本機能テスト
-
-```bash
-cd job-runner-v2
-
-# 位置引数モード
-db_util import test_basic/test_jobs.db test_basic/test_jobs.csv
-job_scheduler test_basic/test_jobs.db test_basic/test_script.sh --max-runtime 60
-
-# 名前付き引数モード
-db_util reset test_basic/test_jobs.db
-job_scheduler test_basic/test_jobs.db "tests/basic/test_script_named.py" --named-args --max-runtime 60
-```
-
-### 複数ノードテスト（TSUBAME）
-
-```bash
-# 10ワーカー × 200ジョブ
-./run_multinode_test.sh
-
-# 進捗監視
-./tests/multinode/setup_multinode_test.py verify test_real_multinode.db
-
-# 結果確認
-./tests/multinode/setup_multinode_test.py verify test_real_multinode.db
-```
-
-### ストレステスト
-
-```bash
-# 1700ジョブ × 30ワーカー
-./test_stress/run_stress_test.sh
-
-# 結果確認
-db_util stats test_stress/stress_1000.db
-db_util stats test_stress/stress_500.db
-db_util stats test_stress/stress_parallel.db
-```
-
-
-### ベンチマーク結果
-
-| テスト | 構成 | 結果 | スループット |
-|--------|------|------|--------------|
-| ローカル | 8並列 × 100ジョブ | 100/100完了 | 42 jobs/sec |
-| 複数ノード | 10ワーカー × 200ジョブ | 200/200完了 | データ整合性100% |
-| 高負荷 | 20ワーカー × 500ジョブ | 494/500完了 | 98.8%成功率 |
-| ストレス | 30ワーカー × 1700ジョブ | 1668/1700完了 | 98.1%成功率 |
-
-※失敗ジョブは意図的なランダム失敗テストによるもの
-
 ## ライセンス
 
 親ディレクトリのLICENSEファイルを参照してください。
-
-## 開発状況
-
-- ✅ Phase 0: SQLite動作確認
-- ✅ Phase 1: 基本実装
-- ✅ Phase 2: 柔軟な実行方式
-- ✅ Phase 3: スケジューリング改善
-- ✅ Phase 4: 並列実行モード
-- ✅ Phase 5: 進捗ビューア
-- ⏳ Phase 6: テスト・ドキュメント（進行中）
-
-**本番環境で使用可能です！**
 
 ## 参考資料
 
 - [QUICKSTART.md](QUICKSTART.md) - 5分でわかる使い方
 - [SETUP.md](SETUP.md) - インストールとセットアップ
-- [README_TEST.md](README_TEST.md) - テスト手順書
 - [README.md](README.md) - English documentation

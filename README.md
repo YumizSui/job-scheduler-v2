@@ -50,17 +50,7 @@ No external dependencies required! (Python 3.6+ standard library only)
 
 - [Quick Start Guide](QUICKSTART.md) - Get started in 5 minutes
 - [Setup Guide](SETUP.md) - Installation and configuration
-- [Full Documentation](README.md) - Complete reference
-- [Test Guide](README_TEST.md) - Testing instructions
 - [日本語ドキュメント](README_ja.md) - Japanese documentation
-
-## Benchmarks
-
-| Test | Configuration | Result | Success Rate |
-|------|---------------|--------|--------------|
-| Local | 8 parallel × 100 jobs | 100/100 | 100% |
-| Multi-node | 10 workers × 200 jobs | 200/200 | 100% |
-| Stress | 30 workers × 1700 jobs | 1668/1700 | 98.1% |
 
 ## License
 
