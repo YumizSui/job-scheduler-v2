@@ -48,7 +48,7 @@ No external dependencies required! (Python 3.6+ standard library only)
 
 ## Documentation
 
-- [Quick Start Guide](QUICKSTART.md) - Get started in 5 minutes
+- [Quick Start Guide](QUICKSTART.md) - Get started
 - [Setup Guide](SETUP.md) - Installation and configuration
 - [日本語ドキュメント](README_ja.md) - Japanese documentation
 

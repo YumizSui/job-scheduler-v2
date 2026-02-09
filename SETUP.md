@@ -112,11 +112,9 @@ If persistent, check for long-running processes or stale locks.
 
 1. Read [QUICKSTART.md](QUICKSTART.md) for usage examples
 2. Check [README.md](README.md) or [README_ja.md](README_ja.md) for full documentation
-3. Run tests to verify your setup (see [README_TEST.md](README_TEST.md))
 
 ## Support
 
 For issues and questions, please check the documentation:
 - [QUICKSTART.md](QUICKSTART.md) - Quick start guide
 - [README.md](README.md) / [README_ja.md](README_ja.md) - Full documentation
-- [README_TEST.md](README_TEST.md) - Testing guide
