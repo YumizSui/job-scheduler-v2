@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# CSV files (except examples)
+*.csv
+!test_basic/test_jobs.csv
+!test_production/production_jobs.csv
+
+# Log files
+*.log
+*.out
+*.err
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*~
+
+# Job locks
+job_locks/
+*.lock
+!.gitkeep
+
+# Test outputs
+test_logs/
+test_basic/*.db
+test_production/*.db
+test_stress/*.db
+test_stress/*.csv
+test_stress/qsub_temp*.sh
+test_multinode_tmp/
+test_stuck/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test intermediate files
+tests/multinode/*.db
+tests/multinode/*.db-*
+tests/multinode/test_logs/
+tests/*.db
+tests/*.db-*
+
+# Internal development files
+local
+*.draft

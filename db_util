@@ -1,0 +1,14 @@
+#!/bin/bash
+# Database Utility - Bash wrapper script
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check if Python is available
+if ! command -v python3 &> /dev/null; then
+    echo "Error: python3 not found" >&2
+    exit 1
+fi
+
+# Run the database utility
+exec python3 "$SCRIPT_DIR/db_util.py" "$@"

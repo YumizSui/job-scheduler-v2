@@ -1,0 +1,15 @@
+#!/bin/bash
+# Job Scheduler v2 - Bash wrapper script
+# This script activates the Python environment and runs the scheduler
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check if Python is available
+if ! command -v python3 &> /dev/null; then
+    echo "Error: python3 not found" >&2
+    exit 1
+fi
+
+# Run the scheduler
+exec python3 "$SCRIPT_DIR/job_scheduler.py" "$@"
