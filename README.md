@@ -10,18 +10,19 @@ SQLite-based parallel job scheduler for HPC environments (TSUBAME, etc.)
 ## Features
 
 - ✅ **Safe Concurrent Access**: SQLite with WAL mode for multi-node safety
+- ✅ **Job Dependencies**: DAG-based dependency management (job dependencies)
 - ✅ **Priority Scheduling**: Execute important jobs first
 - ✅ **Smart Scheduling**: Consider remaining time for job selection
 - ✅ **Flexible Arguments**: Support both positional and named arguments
 - ✅ **Real-time Output**: Stream stdout/stderr in real-time
 - ✅ **Automatic Recovery**: Auto-recover from unexpected interruptions
-- ✅ **Progress Viewer**: Real-time monitoring with dedicated viewer
+- ✅ **Progress Viewer**: Real-time monitoring with dependency status
 
 ## Quick Start
 
 ```bash
 # 1. Import CSV to SQLite
-db_util import jobs.db input.csv
+db_util import jobs.csv
 
 # 2. Run jobs
 job_scheduler jobs.db "bash run.sh"
@@ -35,7 +36,7 @@ progress_viewer jobs.db --watch
 ```bash
 git clone https://github.com/your-username/job-runner-v2.git
 cd job-runner-v2
-chmod +x script/job_scheduler script/db_util.py script/progress_viewer.py
+chmod +x script/job_scheduler script/db_util script/progress_viewer
 
 # Add to PATH
 export PATH="$(pwd)/script:$PATH"

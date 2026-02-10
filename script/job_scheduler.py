@@ -57,6 +57,7 @@ class JobScheduler:
         self.smart_scheduling = kwargs.get('smart_scheduling', True)
         self.named_args = kwargs.get('named_args', False)
         self.parallel = kwargs.get('parallel', 1)
+        self.dep_wait_interval = kwargs.get('dep_wait_interval', 30)
 
         self.start_time = None
         self.jobs_completed = 0
@@ -68,6 +69,16 @@ class JobScheduler:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
+
+        # Create job_dependencies table for backward compatibility
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_dependencies (
+                job_id TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                PRIMARY KEY (job_id, depends_on)
+            )
+        """)
+
         return conn
 
     def get_pending_job(self, available_time: float) -> Optional[Dict]:
@@ -89,6 +100,12 @@ class JobScheduler:
                     SELECT * FROM jobs
                     WHERE JOBSCHEDULER_STATUS = 'pending'
                     AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM job_dependencies d
+                        LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                        WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
+                        AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                    )
                     ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
                     LIMIT 1
                 """
@@ -98,6 +115,12 @@ class JobScheduler:
                 query = """
                     SELECT * FROM jobs
                     WHERE JOBSCHEDULER_STATUS = 'pending'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM job_dependencies d
+                        LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                        WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
+                        AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                    )
                     ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
                     LIMIT 1
                 """
@@ -128,6 +151,31 @@ class JobScheduler:
             logging.warning(f"Database lock conflict: {e}")
             conn.rollback()
             return None
+
+        finally:
+            conn.close()
+
+    def has_blocked_pending_jobs(self) -> bool:
+        """
+        Check if there are pending jobs blocked by running/pending dependencies
+        Returns True if jobs are waiting on dependencies, False otherwise
+        """
+        conn = self.connect_db()
+
+        try:
+            cursor = conn.execute("""
+                SELECT COUNT(*) FROM jobs j
+                WHERE j.JOBSCHEDULER_STATUS = 'pending'
+                AND EXISTS (
+                    SELECT 1 FROM job_dependencies d
+                    JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                    WHERE d.job_id = j.JOBSCHEDULER_JOB_ID
+                    AND dep.JOBSCHEDULER_STATUS IN ('running', 'pending')
+                )
+            """)
+
+            count = cursor.fetchone()[0]
+            return count > 0
 
         finally:
             conn.close()
@@ -206,7 +254,8 @@ class JobScheduler:
             'JOBSCHEDULER_JOB_ID', 'JOBSCHEDULER_STATUS', 'JOBSCHEDULER_PRIORITY',
             'JOBSCHEDULER_ESTIMATE_TIME', 'JOBSCHEDULER_ELAPSED_TIME',
             'JOBSCHEDULER_CREATED_AT', 'JOBSCHEDULER_STARTED_AT',
-            'JOBSCHEDULER_FINISHED_AT', 'JOBSCHEDULER_ERROR_MESSAGE'
+            'JOBSCHEDULER_FINISHED_AT', 'JOBSCHEDULER_ERROR_MESSAGE',
+            'JOBSCHEDULER_DEPENDS_ON'
         }
 
         if self.named_args:
@@ -337,9 +386,16 @@ class JobScheduler:
             job = self.get_pending_job(available_time)
 
             if job is None:
-                if worker_id == 0 or self.parallel == 1:
-                    logging.info(f"Worker {worker_id}: No suitable jobs available. Stopping.")
-                break
+                # Check if there are pending jobs waiting on dependencies
+                if self.has_blocked_pending_jobs():
+                    if worker_id == 0 or self.parallel == 1:
+                        logging.info(f"Worker {worker_id}: No ready jobs. Waiting {self.dep_wait_interval}s for dependencies...")
+                    time.sleep(self.dep_wait_interval)
+                    continue
+                else:
+                    if worker_id == 0 or self.parallel == 1:
+                        logging.info(f"Worker {worker_id}: No suitable jobs available. Stopping.")
+                    break
 
             # Run job
             job_id = job['JOBSCHEDULER_JOB_ID']
@@ -370,6 +426,7 @@ class JobScheduler:
         logging.info(f"Smart scheduling: {self.smart_scheduling}")
         logging.info(f"Named args: {self.named_args}")
         logging.info(f"Parallel: {self.parallel}")
+        logging.info(f"Dependency wait interval: {self.dep_wait_interval}s")
         logging.info("="*60)
 
         # CRITICAL: Recover stuck jobs before starting
@@ -444,7 +501,9 @@ Examples:
     parser.add_argument('--named-args', action='store_true',
                        help='Pass arguments as --key value instead of positional')
     parser.add_argument('--parallel', type=int, default=1,
-                       help='Number of parallel jobs (default: 1, not yet implemented)')
+                       help='Number of parallel jobs (default: 1)')
+    parser.add_argument('--dep-wait-interval', type=int, default=30,
+                       help='Wait interval in seconds when jobs are blocked by dependencies (default: 30)')
 
     args = parser.parse_args()
 
@@ -452,8 +511,6 @@ Examples:
     if not os.path.exists(args.db_file):
         logging.error(f"Database file not found: {args.db_file}")
         sys.exit(1)
-
-    # Parallel mode is now implemented!
 
     # Create scheduler
     scheduler = JobScheduler(
@@ -465,6 +522,7 @@ Examples:
         smart_scheduling=args.smart_scheduling,
         named_args=args.named_args,
         parallel=args.parallel,
+        dep_wait_interval=args.dep_wait_interval,
     )
 
     # Run

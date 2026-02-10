@@ -66,3 +66,7 @@ tests/*.db-*
 # Internal development files
 local
 *.draft
+
+CLAUDE.md
+TSUBAME_JOBS.md
+.gitignore

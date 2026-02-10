@@ -5,16 +5,20 @@
 ### 1. CSVファイルを用意
 
 ```csv
-param1,param2,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_ESTIMATE_TIME
-alpha,100,5,0.5
-beta,200,3,0.3
-gamma,300,8,0.1
+param1,param2,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_ESTIMATE_TIME,JOBSCHEDULER_DEPENDS_ON
+alpha,100,5,0.5,
+beta,200,3,0.3,
+gamma,300,8,0.1,alpha beta
 ```
+
+- `JOBSCHEDULER_DEPENDS_ON`: 依存ジョブID（スペース区切り）
+  - gammaはalphaとbetaが完了してから実行されます
 
 ### 2. SQLiteにインポート
 
 ```bash
-db_util import jobs.db input.csv
+# 自動的に input.db にインポート
+db_util import input.csv
 ```
 
 ### 3. 実行スクリプトを用意
@@ -43,12 +47,12 @@ print(f"Processing: {args.param1}, {args.param2}")
 
 **シングルノード（1プロセス）**:
 ```bash
-job_scheduler jobs.db "bash run.sh"
+job_scheduler input.db "bash run.sh"
 ```
 
-**シングルノード（4並列）**:
+**シングルノード（4並列、依存関係も自動管理）**:
 ```bash
-job_scheduler jobs.db "bash run.sh" --parallel 4
+job_scheduler input.db "bash run.sh" --parallel 4
 ```
 
 **複数ノード（qsub）**:
@@ -61,14 +65,13 @@ job_scheduler jobs.db "bash run.sh" --parallel 4
 #$ -l h_rt=24:00:00
 
 source $HOME/.bashrc
-job_scheduler /path/to/jobs.db "bash run.sh" \
+job_scheduler /path/to/input.db "bash run.sh" \
     --max-runtime 86000 \
     --margin-time 300
 ```
 
 ```bash
-# 10ワーカーを投入
-# アレイジョブで投入（推奨）
+# 10ワーカーを投入（アレイジョブで投入推奨）
 miqsub -t 1-10 qsub_worker.sh
 ```
 
@@ -76,23 +79,35 @@ miqsub -t 1-10 qsub_worker.sh
 
 ```bash
 # 1回だけ確認
-progress_viewer jobs.db
+progress_viewer input.db
 
-# リアルタイム監視
-progress_viewer jobs.db --watch
+# リアルタイム監視（依存状態も表示）
+progress_viewer input.db --watch
+```
+
+**表示例**:
+```
+Statistics:
+  Total jobs:    3
+  Pending:       1 (33.3%)
+    - Ready:     0  ← 今すぐ実行可能
+    - Waiting:   1  ← 依存ジョブ待ち
+    - Blocked:   0  ← エラーでブロック
+  Running:       0
+  Completed:     2 (66.7%)
 ```
 
 ### 6. 結果をCSVにエクスポート
 
 ```bash
-# すべてのジョブ
-db_util export jobs.db output.csv
+# すべてのジョブ（自動的に input.csv にエクスポート）
+db_util export input.db
 
 # 完了したジョブのみ
-db_util export jobs.db done.csv --status done
+db_util export input.db done.csv --status done
 
 # 失敗したジョブのみ
-db_util export jobs.db error.csv --status error
+db_util export input.db error.csv --status error
 ```
 
 ## よくある使い方
@@ -103,8 +118,8 @@ db_util export jobs.db error.csv --status error
 # 1. パラメータCSV生成
 ./tests/production/generate_jobs.py > experiments.csv
 
-# 2. DB作成
-db_util import experiments.db experiments.csv
+# 2. DB作成（自動的に experiments.db が作成される）
+db_util import experiments.csv
 
 # 3. 複数ノードで実行（アレイジョブで投入）
 miqsub -t 1-20 worker.sh  # 20ワーカーで並列実行
@@ -113,17 +128,17 @@ miqsub -t 1-20 worker.sh  # 20ワーカーで並列実行
 watch -n 5 'progress_viewer experiments.db'
 ```
 
-### パターン2: 優先度付きジョブ
+### パターン2: 優先度付き+依存関係のあるジョブ
 
 ```csv
-task,priority,estimate_time
-urgent_task,10,1.0
-normal_task1,5,0.5
-normal_task2,5,0.5
-low_priority,1,2.0
+JOBSCHEDULER_JOB_ID,task,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_ESTIMATE_TIME,JOBSCHEDULER_DEPENDS_ON
+preprocess,data_prep,10,1.0,
+model_train,train_model,5,5.0,preprocess
+model_eval,evaluate,3,0.5,model_train
+report,generate_report,1,0.3,model_eval
 ```
 
-→ urgent_task が最優先で実行される
+→ preprocess → model_train → model_eval → report の順に実行される
 
 ### パターン3: 時間制約のあるジョブ
 
@@ -147,15 +162,41 @@ db_util import retry.db failed.csv
 job_scheduler retry.db "bash run.sh"
 ```
 
+または：
+
+```bash
+# エラージョブのみpendingに戻す
+db_util reset jobs.db --status error
+job_scheduler jobs.db "bash run.sh"
+```
+
+### パターン5: 既存のDBにジョブを追加
+
+```bash
+# 新しいジョブをCSVで作成
+cat > new_jobs.csv <<EOF
+param1,param2
+new_exp1,100
+new_exp2,200
+EOF
+
+# 既存DBに追加（スキーマ整合性チェック付き）
+db_util add jobs.db new_jobs.csv
+```
+
 ## トラブルシューティング
 
 ### Q: ジョブが実行されない
 
 ```bash
-# ステータス確認
-db_util stats jobs.db
+# ステータス確認（依存状態も含む）
+progress_viewer jobs.db
 
-# すべてpendingなのに実行されない場合は、estimate_timeをチェック
+# すべてpendingなのに実行されない場合は、依存関係をチェック
+# - Waiting: 依存ジョブが running/pending
+# - Blocked: 依存ジョブが error
+# - Ready: すぐに実行可能
+
 # estimate_time が大きすぎると、残り時間内に収まらないので実行されない
 ```
 
@@ -164,6 +205,21 @@ db_util stats jobs.db
 ```bash
 # runningで止まっているジョブをpendingに戻す
 db_util reset jobs.db
+
+# エラージョブのみリセット
+db_util reset jobs.db --status error
+```
+
+### Q: 依存ジョブがエラーでブロックされている
+
+```bash
+# ブロック状態を確認
+progress_viewer jobs.db
+# → "Blocked: N" が表示される
+
+# エラーになったジョブだけリセットして再実行
+db_util reset jobs.db --status error
+job_scheduler jobs.db "bash run.sh"
 ```
 
 ### Q: 並列実行してもあまり速くならない

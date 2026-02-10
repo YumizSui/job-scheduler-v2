@@ -43,6 +43,52 @@ class ProgressViewer:
             total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
             stats['total'] = total
 
+            # Check if job_dependencies table exists
+            cursor = conn.execute("""
+                SELECT name FROM sqlite_master WHERE type='table' AND name='job_dependencies'
+            """)
+            has_deps = cursor.fetchone() is not None
+
+            if has_deps:
+                # Count pending jobs that are ready (no blocking dependencies)
+                cursor = conn.execute("""
+                    SELECT COUNT(*) FROM jobs j
+                    WHERE j.JOBSCHEDULER_STATUS = 'pending'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM job_dependencies d
+                        LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                        WHERE d.job_id = j.JOBSCHEDULER_JOB_ID
+                        AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                    )
+                """)
+                stats['pending_ready'] = cursor.fetchone()[0]
+
+                # Count pending jobs waiting on running/pending dependencies
+                cursor = conn.execute("""
+                    SELECT COUNT(*) FROM jobs j
+                    WHERE j.JOBSCHEDULER_STATUS = 'pending'
+                    AND EXISTS (
+                        SELECT 1 FROM job_dependencies d
+                        JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                        WHERE d.job_id = j.JOBSCHEDULER_JOB_ID
+                        AND dep.JOBSCHEDULER_STATUS IN ('running', 'pending')
+                    )
+                """)
+                stats['pending_waiting'] = cursor.fetchone()[0]
+
+                # Count pending jobs blocked by error or non-existent dependencies
+                cursor = conn.execute("""
+                    SELECT COUNT(*) FROM jobs j
+                    WHERE j.JOBSCHEDULER_STATUS = 'pending'
+                    AND EXISTS (
+                        SELECT 1 FROM job_dependencies d
+                        LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                        WHERE d.job_id = j.JOBSCHEDULER_JOB_ID
+                        AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS = 'error')
+                    )
+                """)
+                stats['pending_blocked'] = cursor.fetchone()[0]
+
             return stats
 
         finally:
@@ -143,7 +189,20 @@ class ProgressViewer:
 
         print(f"\nStatistics:")
         print(f"  Total jobs:    {total}")
-        print(f"  Pending:       {pending:4d} ({pending/total*100:.1f}%)" if total > 0 else "  Pending:       0")
+
+        # Show pending breakdown if dependency info is available
+        if 'pending_ready' in stats:
+            pending_ready = stats.get('pending_ready', 0)
+            pending_waiting = stats.get('pending_waiting', 0)
+            pending_blocked = stats.get('pending_blocked', 0)
+            print(f"  Pending:       {pending:4d} ({pending/total*100:.1f}%)" if total > 0 else "  Pending:       0")
+            print(f"    - Ready:     {pending_ready:4d}")
+            print(f"    - Waiting:   {pending_waiting:4d}")
+            if pending_blocked > 0:
+                print(f"    - Blocked:   {pending_blocked:4d}")
+        else:
+            print(f"  Pending:       {pending:4d} ({pending/total*100:.1f}%)" if total > 0 else "  Pending:       0")
+
         print(f"  Running:       {running:4d}")
         print(f"  Completed:     {done:4d} ({done/total*100:.1f}%)" if total > 0 else "  Completed:     0")
         print(f"  Failed:        {error:4d} ({error/total*100:.1f}%)" if total > 0 else "  Failed:        0")
@@ -178,7 +237,8 @@ class ProgressViewer:
                 status = job['JOBSCHEDULER_STATUS']
                 elapsed = job['JOBSCHEDULER_ELAPSED_TIME']
                 status_icon = "✓" if status == 'done' else "✗"
-                print(f"  {status_icon} {job_id} ({elapsed:.2f}s)")
+                elapsed_str = f"({elapsed:.2f}s)" if elapsed is not None else "(no time)"
+                print(f"  {status_icon} {job_id} {elapsed_str}")
 
         print("\n" + "="*70)
 
