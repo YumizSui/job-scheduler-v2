@@ -102,7 +102,9 @@ class ProgressViewer:
             cursor = conn.execute("""
                 SELECT JOBSCHEDULER_JOB_ID,
                        JOBSCHEDULER_STARTED_AT,
-                       JOBSCHEDULER_PRIORITY
+                       JOBSCHEDULER_PRIORITY,
+                       JOBSCHEDULER_WORKER_ID,
+                       JOBSCHEDULER_HEARTBEAT
                 FROM jobs
                 WHERE JOBSCHEDULER_STATUS = 'running'
                 ORDER BY JOBSCHEDULER_STARTED_AT DESC
@@ -223,7 +225,22 @@ class ProgressViewer:
                 job_id = job['JOBSCHEDULER_JOB_ID']
                 started = job['JOBSCHEDULER_STARTED_AT']
                 priority = job['JOBSCHEDULER_PRIORITY']
-                print(f"  • {job_id} (priority={priority}, started={started})")
+                worker_id = job.get('JOBSCHEDULER_WORKER_ID', 'unknown')
+                heartbeat = job.get('JOBSCHEDULER_HEARTBEAT')
+
+                # Calculate heartbeat age
+                if heartbeat:
+                    try:
+                        heartbeat_dt = datetime.fromisoformat(heartbeat)
+                        now = datetime.utcnow()
+                        age_seconds = int((now - heartbeat_dt).total_seconds())
+                        heartbeat_info = f"heartbeat={age_seconds}s ago"
+                    except:
+                        heartbeat_info = f"heartbeat={heartbeat}"
+                else:
+                    heartbeat_info = "heartbeat=never"
+
+                print(f"  • {job_id} (worker={worker_id}, {heartbeat_info}, priority={priority})")
 
             if len(running_jobs) > 10:
                 print(f"  ... and {len(running_jobs) - 10} more")

@@ -31,6 +31,8 @@ class JobDatabase:
         'JOBSCHEDULER_FINISHED_AT',
         'JOBSCHEDULER_ERROR_MESSAGE',
         'JOBSCHEDULER_DEPENDS_ON',
+        'JOBSCHEDULER_HEARTBEAT',
+        'JOBSCHEDULER_WORKER_ID',
     }
 
     def __init__(self, db_path: str):
@@ -79,6 +81,8 @@ class JobDatabase:
             "JOBSCHEDULER_FINISHED_AT TEXT",
             "JOBSCHEDULER_ERROR_MESSAGE TEXT",
             "JOBSCHEDULER_DEPENDS_ON TEXT",
+            "JOBSCHEDULER_HEARTBEAT TEXT",
+            "JOBSCHEDULER_WORKER_ID TEXT",
         ]
 
         # Add user columns
@@ -366,41 +370,56 @@ def main():
     parser = argparse.ArgumentParser(
         description="Database utility for job-runner v2"
     )
-    parser.add_argument('command', choices=['import', 'export', 'stats', 'reset', 'add'],
-                       help='Command to execute')
-    parser.add_argument('db_file', help='SQLite database file path')
-    parser.add_argument('csv_file', nargs='?', help='CSV file path (for import/export/add)')
-    parser.add_argument('--status', help='Filter by status (for export/reset)')
-    parser.add_argument('--no-reset', action='store_true',
-                       help='Keep existing status when importing (default: reset to pending)')
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute', required=True)
+
+    # import: csv_file [--db-path path.db]
+    import_parser = subparsers.add_parser('import', help='Import CSV to SQLite (creates new DB or resets existing)')
+    import_parser.add_argument('csv_file', help='CSV file path')
+    import_parser.add_argument('--db-path', help='SQLite database file path (default: csv_file with .db extension)')
+
+    # add: csv_file --db-path path.db
+    add_parser = subparsers.add_parser('add', help='Add jobs from CSV to existing database')
+    add_parser.add_argument('csv_file', help='CSV file path')
+    add_parser.add_argument('--db-path', required=True, help='SQLite database file path')
+
+    # export: db_file [--csv-path out.csv] [--status STATUS]
+    export_parser = subparsers.add_parser('export', help='Export SQLite to CSV')
+    export_parser.add_argument('db_file', help='SQLite database file path')
+    export_parser.add_argument('--csv-path', help='CSV file path (default: db_file with .csv extension)')
+    export_parser.add_argument('--status', help='Filter by status (pending/running/done/error)')
+
+    # stats: db_file
+    stats_parser = subparsers.add_parser('stats', help='Show job statistics')
+    stats_parser.add_argument('db_file', help='SQLite database file path')
+
+    # reset: db_file [--status STATUS]
+    reset_parser = subparsers.add_parser('reset', help='Reset jobs to pending status')
+    reset_parser.add_argument('db_file', help='SQLite database file path')
+    reset_parser.add_argument('--status', help='Reset only jobs with specific status')
 
     args = parser.parse_args()
 
-    # Handle auto-detection for import/add
-    if args.command in ('import', 'add'):
-        if args.db_file.endswith('.csv'):
-            # User provided CSV first: db_util import experiments.csv
-            args.csv_file = args.db_file
-            args.db_file = str(Path(args.db_file).with_suffix('.db'))
-        elif not args.csv_file:
-            parser.error(f"{args.command} requires csv_file argument")
+    # Handle defaults for import
+    if args.command == 'import':
+        db_file = args.db_path if args.db_path else str(Path(args.csv_file).with_suffix('.db'))
+        csv_file = args.csv_file
+        with JobDatabase(db_file) as db:
+            db.import_csv(csv_file, reset_status=True)
 
-    # Handle auto-detection for export
-    if args.command == 'export' and not args.csv_file:
-        args.csv_file = str(Path(args.db_file).with_suffix('.csv'))
-
-    # Execute command
-    with JobDatabase(args.db_file) as db:
-        if args.command == 'import':
-            db.import_csv(args.csv_file, reset_status=not args.no_reset)
-
-        elif args.command == 'add':
+    # Handle add
+    elif args.command == 'add':
+        with JobDatabase(args.db_path) as db:
             db.add_csv(args.csv_file)
 
-        elif args.command == 'export':
-            db.export_csv(args.csv_file, status_filter=args.status)
+    # Handle export
+    elif args.command == 'export':
+        csv_file = args.csv_path if args.csv_path else str(Path(args.db_file).with_suffix('.csv'))
+        with JobDatabase(args.db_file) as db:
+            db.export_csv(csv_file, status_filter=args.status)
 
-        elif args.command == 'stats':
+    # Handle stats
+    elif args.command == 'stats':
+        with JobDatabase(args.db_file) as db:
             stats = db.get_stats()
             print("\nJob Statistics:")
             print(f"  Total: {stats.get('total', 0)}")
@@ -409,8 +428,9 @@ def main():
             print(f"  Done: {stats.get('done', 0)}")
             print(f"  Error: {stats.get('error', 0)}")
 
-        elif args.command == 'reset':
-            # Reset jobs to pending (all or filtered by status)
+    # Handle reset
+    elif args.command == 'reset':
+        with JobDatabase(args.db_file) as db:
             if args.status:
                 # Reset only jobs with specific status
                 db.conn.execute("""

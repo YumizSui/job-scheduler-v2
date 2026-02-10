@@ -104,10 +104,10 @@ Statistics:
 db_util export input.db
 
 # 完了したジョブのみ
-db_util export input.db done.csv --status done
+db_util export input.db --csv-path done.csv --status done
 
 # 失敗したジョブのみ
-db_util export input.db error.csv --status error
+db_util export input.db --csv-path error.csv --status error
 ```
 
 ## よくある使い方
@@ -153,10 +153,10 @@ job_scheduler jobs.db "bash run.sh" \
 
 ```bash
 # 1. 失敗ジョブをエクスポート
-db_util export jobs.db failed.csv --status error
+db_util export jobs.db --csv-path failed.csv --status error
 
 # 2. 新しいDBにインポート
-db_util import retry.db failed.csv
+db_util import failed.csv --db-path retry.db
 
 # 3. 再実行
 job_scheduler retry.db "bash run.sh"
@@ -181,7 +181,7 @@ new_exp2,200
 EOF
 
 # 既存DBに追加（スキーマ整合性チェック付き）
-db_util add jobs.db new_jobs.csv
+db_util add new_jobs.csv --db-path jobs.db
 ```
 
 ## トラブルシューティング
@@ -203,7 +203,11 @@ progress_viewer jobs.db
 ### Q: 途中でジョブが止まった
 
 ```bash
-# runningで止まっているジョブをpendingに戻す
+# スケジューラを起動すると、ハートビートが2分以上途絶えたジョブは自動的にpendingに戻ります
+# アクティブなワーカーのジョブは保護されるため、安全に新しいワーカーを追加できます
+job_scheduler jobs.db "bash run.sh"
+
+# 手動でリセットする場合（全runningジョブをpendingに戻す）
 db_util reset jobs.db
 
 # エラージョブのみリセット

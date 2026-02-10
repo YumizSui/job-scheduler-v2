@@ -132,19 +132,18 @@ jobD,evaluation,jobC
 # CSV → SQLite（自動的にファイル名から.dbに変換）
 db_util import jobs.csv
 
-# 従来通りの指定も可能
-db_util import jobs.db input.csv
+# 出力先を明示的に指定
+db_util import input.csv --db-path jobs.db
 
 # 既存DBにジョブ追加（スキーマ整合性チェック付き）
-db_util add new_jobs.csv  # 自動的に new_jobs.db に追加
-db_util add jobs.db new_jobs.csv  # 明示的な指定も可能
+db_util add new_jobs.csv --db-path jobs.db
 
 # SQLite → CSV（自動的にファイル名から.csvに変換）
 db_util export jobs.db
 
 # フィルタ付きエクスポート
-db_util export jobs.db done.csv --status done
-db_util export jobs.db error.csv --status error
+db_util export jobs.db --csv-path done.csv --status done
+db_util export jobs.db --csv-path error.csv --status error
 
 # 統計表示
 db_util stats jobs.db
@@ -194,6 +193,8 @@ job_scheduler <db_file> <command> [options]
   --named-args          名前付き引数モード（--key value形式）
   --parallel N          並列実行数（デフォルト: 1）
   --dep-wait-interval SEC  依存待ち時の待機間隔（秒）（デフォルト: 30）
+  --heartbeat-interval SEC ハートビート更新間隔（秒）（デフォルト: 30）
+  --stale-threshold SEC    stuck判定の閾値（秒）（デフォルト: 120）
 ```
 
 ## 予約カラム名
@@ -210,6 +211,8 @@ job_scheduler <db_file> <command> [options]
 - `JOBSCHEDULER_STARTED_AT` - 開始日時
 - `JOBSCHEDULER_FINISHED_AT` - 終了日時
 - `JOBSCHEDULER_ERROR_MESSAGE` - エラーメッセージ
+- `JOBSCHEDULER_HEARTBEAT` - ワーカーの最終生存確認時刻
+- `JOBSCHEDULER_WORKER_ID` - ワーカー識別子（hostname:PID）
 
 ## 動作の仕組み
 
@@ -239,19 +242,21 @@ job_scheduler <db_file> <command> [options]
 
 - **WALモード**: 複数リーダー + 1ライター同時アクセス
 - **BEGIN IMMEDIATE**: 早期にロックを取得して競合を検出
-- **busy_timeout=30秒**: ロック競合時は自動リトライ
+- **busy_timeout=30秒**: ロック競合時は自動リトライ（最大3回）
 - **アトミック更新**: すべてのステータス変更はトランザクション内で実行
-- **Stuck Job Recovery**: 起動時に`running`状態で止まっているジョブを自動的に`pending`に復旧
+- **ハートビート方式**: 実行中ジョブは30秒ごとに生存を通知
+- **Stuck Job Recovery**: 起動時にハートビートが2分以上途絶えたジョブのみを`pending`に復旧（アクティブなワーカーのジョブは保護）
 
 ## トラブルシューティング
 
 ### Q: ジョブが`running`状態で止まっている
 
 ```bash
-# スケジューラを再起動すると自動的にpendingに戻ります
+# スケジューラを起動すると、ハートビートが2分以上途絶えたジョブは自動的にpendingに戻ります
+# アクティブなワーカーのジョブは保護されるため、安全に新しいワーカーを追加できます
 job_scheduler jobs.db "bash run.sh"
 
-# または手動でリセット
+# 手動でリセットする場合（全ジョブをpendingに戻す）
 db_util reset jobs.db
 ```
 

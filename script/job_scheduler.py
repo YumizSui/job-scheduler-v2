@@ -19,6 +19,7 @@ import time
 import signal
 import sys
 import os
+import socket
 import logging
 from typing import Optional, Dict, List, Tuple
 from threading import Event, Thread
@@ -58,6 +59,11 @@ class JobScheduler:
         self.named_args = kwargs.get('named_args', False)
         self.parallel = kwargs.get('parallel', 1)
         self.dep_wait_interval = kwargs.get('dep_wait_interval', 30)
+        self.heartbeat_interval = kwargs.get('heartbeat_interval', 30)
+        self.stale_threshold = kwargs.get('stale_threshold', 120)
+
+        # Generate worker ID (hostname:PID)
+        self.worker_id = f"{socket.gethostname()}:{os.getpid()}"
 
         self.start_time = None
         self.jobs_completed = 0
@@ -79,6 +85,16 @@ class JobScheduler:
             )
         """)
 
+        # Auto-migration: Add heartbeat columns if they don't exist
+        cursor = conn.execute("PRAGMA table_info(jobs)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'JOBSCHEDULER_HEARTBEAT' not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN JOBSCHEDULER_HEARTBEAT TEXT")
+
+        if 'JOBSCHEDULER_WORKER_ID' not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN JOBSCHEDULER_WORKER_ID TEXT")
+
         return conn
 
     def get_pending_job(self, available_time: float) -> Optional[Dict]:
@@ -87,73 +103,85 @@ class JobScheduler:
 
         Returns job dict or None if no suitable job available
         """
-        conn = self.connect_db()
+        max_retries = 3
+        retry_delay = 1  # seconds
 
-        try:
-            # Start transaction with immediate lock
-            conn.execute("BEGIN IMMEDIATE")
+        for attempt in range(max_retries):
+            conn = self.connect_db()
 
-            # Build query based on smart scheduling
-            if self.smart_scheduling and available_time > 0:
-                # Only select jobs that can complete within available time
-                query = """
-                    SELECT * FROM jobs
-                    WHERE JOBSCHEDULER_STATUS = 'pending'
-                    AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
-                    AND NOT EXISTS (
-                        SELECT 1 FROM job_dependencies d
-                        LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
-                        WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
-                        AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
-                    )
-                    ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
-                    LIMIT 1
-                """
-                cursor = conn.execute(query, (self.speed_factor, available_time))
-            else:
-                # Simple priority-based selection
-                query = """
-                    SELECT * FROM jobs
-                    WHERE JOBSCHEDULER_STATUS = 'pending'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM job_dependencies d
-                        LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
-                        WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
-                        AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
-                    )
-                    ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
-                    LIMIT 1
-                """
-                cursor = conn.execute(query)
+            try:
+                # Start transaction with immediate lock
+                conn.execute("BEGIN IMMEDIATE")
 
-            row = cursor.fetchone()
+                # Build query based on smart scheduling
+                if self.smart_scheduling and available_time > 0:
+                    # Only select jobs that can complete within available time
+                    query = """
+                        SELECT * FROM jobs
+                        WHERE JOBSCHEDULER_STATUS = 'pending'
+                        AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM job_dependencies d
+                            LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                            WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
+                            AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                        )
+                        ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
+                        LIMIT 1
+                    """
+                    cursor = conn.execute(query, (self.speed_factor, available_time))
+                else:
+                    # Simple priority-based selection
+                    query = """
+                        SELECT * FROM jobs
+                        WHERE JOBSCHEDULER_STATUS = 'pending'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM job_dependencies d
+                            LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                            WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
+                            AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                        )
+                        ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
+                        LIMIT 1
+                    """
+                    cursor = conn.execute(query)
 
-            if row is None:
+                row = cursor.fetchone()
+
+                if row is None:
+                    conn.rollback()
+                    return None
+
+                # Convert to dict
+                job = dict(row)
+                job_id = job['JOBSCHEDULER_JOB_ID']
+
+                # Mark as running with heartbeat and worker_id
+                conn.execute("""
+                    UPDATE jobs
+                    SET JOBSCHEDULER_STATUS = 'running',
+                        JOBSCHEDULER_STARTED_AT = datetime('now'),
+                        JOBSCHEDULER_HEARTBEAT = datetime('now'),
+                        JOBSCHEDULER_WORKER_ID = ?
+                    WHERE JOBSCHEDULER_JOB_ID = ?
+                """, (self.worker_id, job_id))
+
+                conn.commit()
+                return job
+
+            except sqlite3.OperationalError as e:
                 conn.rollback()
-                return None
+                if attempt < max_retries - 1:
+                    logging.warning(f"Database lock conflict (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                else:
+                    logging.warning(f"Database lock conflict after {max_retries} attempts: {e}")
+                    return None
 
-            # Convert to dict
-            job = dict(row)
-            job_id = job['JOBSCHEDULER_JOB_ID']
+            finally:
+                conn.close()
 
-            # Mark as running
-            conn.execute("""
-                UPDATE jobs
-                SET JOBSCHEDULER_STATUS = 'running',
-                    JOBSCHEDULER_STARTED_AT = datetime('now')
-                WHERE JOBSCHEDULER_JOB_ID = ?
-            """, (job_id,))
-
-            conn.commit()
-            return job
-
-        except sqlite3.OperationalError as e:
-            logging.warning(f"Database lock conflict: {e}")
-            conn.rollback()
-            return None
-
-        finally:
-            conn.close()
+        return None
 
     def has_blocked_pending_jobs(self) -> bool:
         """
@@ -182,36 +210,58 @@ class JobScheduler:
 
     def recover_stuck_jobs(self):
         """
-        Recover jobs stuck in 'running' state.
-        This happens when scheduler is killed/interrupted.
-        Resets all 'running' jobs to 'pending'.
+        Recover jobs stuck in 'running' state using heartbeat detection.
+        Only resets jobs whose heartbeat is older than stale_threshold or NULL.
+        This prevents resetting jobs that are actively running on other workers.
         """
         conn = self.connect_db()
 
         try:
             conn.execute("BEGIN IMMEDIATE")
 
-            # Count stuck jobs
+            # Count stuck jobs (heartbeat is NULL or too old)
             cursor = conn.execute("""
-                SELECT COUNT(*) FROM jobs WHERE JOBSCHEDULER_STATUS = 'running'
-            """)
+                SELECT COUNT(*) FROM jobs
+                WHERE JOBSCHEDULER_STATUS = 'running'
+                AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                     OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+            """, (self.stale_threshold,))
             stuck_count = cursor.fetchone()[0]
 
             if stuck_count > 0:
-                logging.warning(f"Found {stuck_count} stuck jobs in 'running' state. Resetting to 'pending'...")
+                logging.warning(f"Found {stuck_count} stuck jobs (heartbeat older than {self.stale_threshold}s). Resetting to 'pending'...")
 
-                # Reset running jobs to pending
+                # Get stuck job IDs for logging
+                cursor = conn.execute("""
+                    SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID, JOBSCHEDULER_HEARTBEAT
+                    FROM jobs
+                    WHERE JOBSCHEDULER_STATUS = 'running'
+                    AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                         OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+                """, (self.stale_threshold,))
+
+                for row in cursor.fetchall():
+                    job_id = row[0]
+                    worker_id = row[1] or 'unknown'
+                    heartbeat = row[2] or 'never'
+                    logging.info(f"  Resetting stuck job: {job_id} (worker={worker_id}, last_heartbeat={heartbeat})")
+
+                # Reset stuck jobs to pending
                 conn.execute("""
                     UPDATE jobs
                     SET JOBSCHEDULER_STATUS = 'pending',
-                        JOBSCHEDULER_STARTED_AT = NULL
+                        JOBSCHEDULER_STARTED_AT = NULL,
+                        JOBSCHEDULER_HEARTBEAT = NULL,
+                        JOBSCHEDULER_WORKER_ID = NULL
                     WHERE JOBSCHEDULER_STATUS = 'running'
-                """)
+                    AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                         OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+                """, (self.stale_threshold,))
 
                 conn.commit()
                 logging.info(f"✓ Reset {stuck_count} stuck jobs to 'pending'")
             else:
-                logging.info("No stuck jobs found")
+                logging.info("No stuck jobs found (all running jobs have recent heartbeats)")
 
         except sqlite3.OperationalError as e:
             logging.error(f"Failed to recover stuck jobs: {e}")
@@ -221,7 +271,7 @@ class JobScheduler:
 
     def mark_job_done(self, job_id: str, status: str, elapsed_time: float,
                      error_message: Optional[str] = None):
-        """Mark job as done/error"""
+        """Mark job as done/error and clear heartbeat/worker_id"""
         conn = self.connect_db()
 
         try:
@@ -232,7 +282,9 @@ class JobScheduler:
                 SET JOBSCHEDULER_STATUS = ?,
                     JOBSCHEDULER_ELAPSED_TIME = ?,
                     JOBSCHEDULER_FINISHED_AT = datetime('now'),
-                    JOBSCHEDULER_ERROR_MESSAGE = ?
+                    JOBSCHEDULER_ERROR_MESSAGE = ?,
+                    JOBSCHEDULER_HEARTBEAT = NULL,
+                    JOBSCHEDULER_WORKER_ID = NULL
                 WHERE JOBSCHEDULER_JOB_ID = ?
             """, (status, elapsed_time, error_message, job_id))
 
@@ -255,7 +307,7 @@ class JobScheduler:
             'JOBSCHEDULER_ESTIMATE_TIME', 'JOBSCHEDULER_ELAPSED_TIME',
             'JOBSCHEDULER_CREATED_AT', 'JOBSCHEDULER_STARTED_AT',
             'JOBSCHEDULER_FINISHED_AT', 'JOBSCHEDULER_ERROR_MESSAGE',
-            'JOBSCHEDULER_DEPENDS_ON'
+            'JOBSCHEDULER_DEPENDS_ON', 'JOBSCHEDULER_HEARTBEAT', 'JOBSCHEDULER_WORKER_ID'
         }
 
         if self.named_args:
@@ -272,6 +324,22 @@ class JobScheduler:
 
         return cmd
 
+    def _heartbeat_worker(self, job_id: str, stop_event: Event):
+        """Background thread to update job heartbeat"""
+        while not stop_event.is_set():
+            try:
+                conn = self.connect_db()
+                conn.execute(
+                    "UPDATE jobs SET JOBSCHEDULER_HEARTBEAT = datetime('now') WHERE JOBSCHEDULER_JOB_ID = ?",
+                    (job_id,)
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logging.warning(f"Failed to update heartbeat for job {job_id}: {e}")
+
+            stop_event.wait(self.heartbeat_interval)
+
     def run_job(self, job: Dict, max_time: float) -> Tuple[int, float, Optional[str]]:
         """
         Execute a single job
@@ -285,6 +353,12 @@ class JobScheduler:
 
         start_time = time.time()
         error_message = None
+
+        # Start heartbeat thread
+        heartbeat_stop = Event()
+        heartbeat_thread = Thread(target=self._heartbeat_worker, args=(job_id, heartbeat_stop))
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
 
         try:
             # Start subprocess
@@ -365,6 +439,11 @@ class JobScheduler:
             logging.error(f"Job {job_id} failed: {error_message}")
             return -1, elapsed_time, error_message
 
+        finally:
+            # Stop heartbeat thread
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=2)
+
     def run_scheduling_worker(self, worker_id: int = 0):
         """Single worker scheduling loop"""
         self.start_time = time.time()
@@ -419,6 +498,7 @@ class JobScheduler:
         logging.info("Job Scheduler v2 starting")
         logging.info("="*60)
         logging.info(f"Database: {self.db_path}")
+        logging.info(f"Worker ID: {self.worker_id}")
         logging.info(f"Command: {self.command}")
         logging.info(f"Max runtime: {self.max_runtime}s")
         logging.info(f"Margin time: {self.margin_time}s")
@@ -427,6 +507,8 @@ class JobScheduler:
         logging.info(f"Named args: {self.named_args}")
         logging.info(f"Parallel: {self.parallel}")
         logging.info(f"Dependency wait interval: {self.dep_wait_interval}s")
+        logging.info(f"Heartbeat interval: {self.heartbeat_interval}s")
+        logging.info(f"Stale threshold: {self.stale_threshold}s")
         logging.info("="*60)
 
         # CRITICAL: Recover stuck jobs before starting
@@ -504,6 +586,10 @@ Examples:
                        help='Number of parallel jobs (default: 1)')
     parser.add_argument('--dep-wait-interval', type=int, default=30,
                        help='Wait interval in seconds when jobs are blocked by dependencies (default: 30)')
+    parser.add_argument('--heartbeat-interval', type=int, default=30,
+                       help='Heartbeat update interval in seconds (default: 30)')
+    parser.add_argument('--stale-threshold', type=int, default=120,
+                       help='Threshold in seconds to consider a job stale/stuck (default: 120)')
 
     args = parser.parse_args()
 
@@ -523,6 +609,8 @@ Examples:
         named_args=args.named_args,
         parallel=args.parallel,
         dep_wait_interval=args.dep_wait_interval,
+        heartbeat_interval=args.heartbeat_interval,
+        stale_threshold=args.stale_threshold,
     )
 
     # Run

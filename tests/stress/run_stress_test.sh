@@ -24,7 +24,7 @@ echo ""
 echo -e "${GREEN}Test 1: Large Job Count (1000 jobs, 5 workers)${NC}"
 echo "Generating jobs..."
 python3 test_stress/generate_stress_jobs.py 1000 test_stress/stress_1000.csv
-python3 db_util.py import test_stress/stress_1000.db test_stress/stress_1000.csv
+python3 db_util.py import test_stress/stress_1000.csv --db-path test_stress/stress_1000.db
 
 echo "Submitting workers..."
 for i in $(seq 1 5); do
@@ -51,7 +51,7 @@ echo ""
 echo -e "${GREEN}Test 2: High Concurrency (500 jobs, 20 workers)${NC}"
 echo "Generating jobs..."
 python3 test_stress/generate_stress_jobs.py 500 test_stress/stress_500.csv
-python3 db_util.py import test_stress/stress_500.db test_stress/stress_500.csv
+python3 db_util.py import test_stress/stress_500.csv --db-path test_stress/stress_500.db
 
 echo "Submitting workers..."
 for i in $(seq 1 20); do
@@ -78,7 +78,7 @@ echo ""
 echo -e "${GREEN}Test 3: Parallel Mode Stress (200 jobs, 5 workers × 4 parallel)${NC}"
 echo "Generating jobs..."
 python3 test_stress/generate_stress_jobs.py 200 test_stress/stress_parallel.csv
-python3 db_util.py import test_stress/stress_parallel.db test_stress/stress_parallel.csv
+python3 db_util.py import test_stress/stress_parallel.csv --db-path test_stress/stress_parallel.db
 
 echo "Submitting workers..."
 for i in $(seq 1 5); do

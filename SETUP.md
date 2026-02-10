@@ -39,7 +39,7 @@ progress_viewer --help
 ```bash
 # Run basic test
 cd test_basic
-db_util import test.db test_jobs.csv
+db_util import test_jobs.csv --db-path test.db
 job_scheduler test.db "bash test_script.sh" --max-runtime 60
 
 # Check results
