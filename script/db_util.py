@@ -232,6 +232,9 @@ class JobDatabase:
 
     def add_csv(self, csv_path: str):
         """Add jobs from CSV to existing database"""
+        if not self.table_exists():
+            raise RuntimeError("Database is not initialized. Use 'import' command to create the schema first.")
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             rows = list(reader)
@@ -318,6 +321,9 @@ class JobDatabase:
 
     def export_csv(self, csv_path: str, status_filter: Optional[str] = None):
         """Export jobs to CSV file"""
+        if not self.table_exists():
+            raise RuntimeError("Database is not initialized. Use 'import' command to create the schema.")
+
         # Build query
         query = "SELECT * FROM jobs"
         params = []
@@ -348,8 +354,19 @@ class JobDatabase:
 
         print(f"✓ Exported {len(rows)} jobs to {csv_path}")
 
+    def table_exists(self, table_name: str = 'jobs') -> bool:
+        """Check if table exists in database"""
+        cursor = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        )
+        return cursor.fetchone() is not None
+
     def get_stats(self) -> Dict[str, int]:
         """Get job statistics"""
+        if not self.table_exists():
+            raise RuntimeError("Database is not initialized. Use 'import' command to create the schema.")
+
         cursor = self.conn.execute("""
             SELECT JOBSCHEDULER_STATUS, COUNT(*) as count
             FROM jobs
@@ -408,17 +425,23 @@ def main():
 
     # Handle add
     elif args.command == 'add':
+        if not Path(args.db_path).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_path}")
         with JobDatabase(args.db_path) as db:
             db.add_csv(args.csv_file)
 
     # Handle export
     elif args.command == 'export':
+        if not Path(args.db_file).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_file}")
         csv_file = args.csv_path if args.csv_path else str(Path(args.db_file).with_suffix('.csv'))
         with JobDatabase(args.db_file) as db:
             db.export_csv(csv_file, status_filter=args.status)
 
     # Handle stats
     elif args.command == 'stats':
+        if not Path(args.db_file).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_file}")
         with JobDatabase(args.db_file) as db:
             stats = db.get_stats()
             print("\nJob Statistics:")
@@ -430,7 +453,11 @@ def main():
 
     # Handle reset
     elif args.command == 'reset':
+        if not Path(args.db_file).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_file}")
         with JobDatabase(args.db_file) as db:
+            if not db.table_exists():
+                sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
             if args.status:
                 # Reset only jobs with specific status
                 db.conn.execute("""
