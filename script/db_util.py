@@ -389,10 +389,11 @@ def main():
     )
     subparsers = parser.add_subparsers(dest='command', help='Command to execute', required=True)
 
-    # import: csv_file [--db-path path.db]
+    # import: csv_file [--db-path path.db] [--force]
     import_parser = subparsers.add_parser('import', help='Import CSV to SQLite (creates new DB or resets existing)')
     import_parser.add_argument('csv_file', help='CSV file path')
     import_parser.add_argument('--db-path', help='SQLite database file path (default: csv_file with .db extension)')
+    import_parser.add_argument('--force', action='store_true', help='Overwrite existing database file without confirmation')
 
     # add: csv_file --db-path path.db
     add_parser = subparsers.add_parser('add', help='Add jobs from CSV to existing database')
@@ -404,6 +405,7 @@ def main():
     export_parser.add_argument('db_file', help='SQLite database file path')
     export_parser.add_argument('--csv-path', help='CSV file path (default: db_file with .csv extension)')
     export_parser.add_argument('--status', help='Filter by status (pending/running/done/error)')
+    export_parser.add_argument('--force', action='store_true', help='Overwrite existing CSV file without confirmation')
 
     # stats: db_file
     stats_parser = subparsers.add_parser('stats', help='Show job statistics')
@@ -420,6 +422,8 @@ def main():
     if args.command == 'import':
         db_file = args.db_path if args.db_path else str(Path(args.csv_file).with_suffix('.db'))
         csv_file = args.csv_file
+        if Path(db_file).exists() and not args.force:
+            sys.exit(f"Error: Database file already exists: {db_file}\nUse --force to overwrite.")
         with JobDatabase(db_file) as db:
             db.import_csv(csv_file, reset_status=True)
 
@@ -435,6 +439,8 @@ def main():
         if not Path(args.db_file).exists():
             sys.exit(f"Error: Database file does not exist: {args.db_file}")
         csv_file = args.csv_path if args.csv_path else str(Path(args.db_file).with_suffix('.csv'))
+        if Path(csv_file).exists() and not args.force:
+            sys.exit(f"Error: CSV file already exists: {csv_file}\nUse --force to overwrite.")
         with JobDatabase(args.db_file) as db:
             db.export_csv(csv_file, status_filter=args.status)
 

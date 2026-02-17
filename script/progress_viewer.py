@@ -11,6 +11,7 @@ import argparse
 import time
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 
@@ -287,6 +288,9 @@ def main():
                        help='Update interval in seconds for watch mode (default: 2)')
 
     args = parser.parse_args()
+
+    if not Path(args.db_file).exists():
+        sys.exit(f"Error: Database file does not exist: {args.db_file}")
 
     viewer = ProgressViewer(args.db_file)
 
