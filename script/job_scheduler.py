@@ -481,16 +481,15 @@ class JobScheduler:
             return_code, elapsed_time, error_message = self.run_job(job, available_time)
 
             # Update job status
-            if not shutdown_event.is_set():
-                if return_code == 0:
-                    self.mark_job_done(job_id, 'done', elapsed_time)
-                    self.jobs_completed += 1
-                elif return_code == -2:
-                    # Timeout or interrupted - mark as pending for retry
-                    self.mark_job_done(job_id, 'pending', elapsed_time, error_message)
-                else:
-                    self.mark_job_done(job_id, 'error', elapsed_time, error_message)
-                    self.jobs_failed += 1
+            if return_code == 0 and not shutdown_event.is_set():
+                self.mark_job_done(job_id, 'done', elapsed_time)
+                self.jobs_completed += 1
+            elif return_code == -2 or shutdown_event.is_set():
+                # Timeout or interrupted - mark as pending for retry
+                self.mark_job_done(job_id, 'pending', elapsed_time, error_message)
+            else:
+                self.mark_job_done(job_id, 'error', elapsed_time, error_message)
+                self.jobs_failed += 1
 
     def run_scheduling(self):
         """Main scheduling loop - manages parallel workers if needed"""
