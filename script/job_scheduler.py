@@ -447,6 +447,7 @@ class JobScheduler:
     def run_scheduling_worker(self, worker_id: int = 0):
         """Single worker scheduling loop"""
         self.start_time = time.time()
+        last_recovery_time = 0.0
 
         while not shutdown_event.is_set():
             elapsed = time.time() - self.start_time
@@ -460,6 +461,12 @@ class JobScheduler:
             if available_time <= 0:
                 logging.info("Not enough available time remaining (considering margin). Stopping.")
                 break
+
+            # Periodically recover stuck jobs (worker 0 only to avoid contention)
+            now = time.time()
+            if worker_id == 0 and now - last_recovery_time >= self.stale_threshold:
+                self.recover_stuck_jobs()
+                last_recovery_time = now
 
             # Get next job
             job = self.get_pending_job(available_time)
