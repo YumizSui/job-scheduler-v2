@@ -18,8 +18,10 @@ from typing import Dict, List, Optional
 class ProgressViewer:
     """Progress viewer for job database"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, stale_threshold: int = 120, auto_recover: bool = True):
         self.db_path = db_path
+        self.stale_threshold = stale_threshold
+        self.auto_recover = auto_recover
 
     def connect_db(self) -> sqlite3.Connection:
         """Create database connection"""
@@ -167,8 +169,56 @@ class ProgressViewer:
         finally:
             conn.close()
 
+    def recover_stuck_jobs(self) -> int:
+        """Recover jobs stuck in 'running' state with stale or missing heartbeat.
+
+        Returns the number of jobs recovered.
+        """
+        conn = self.connect_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            cursor = conn.execute("""
+                SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID, JOBSCHEDULER_HEARTBEAT
+                FROM jobs
+                WHERE JOBSCHEDULER_STATUS = 'running'
+                AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                     OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+            """, (self.stale_threshold,))
+            stuck_jobs = cursor.fetchall()
+
+            if stuck_jobs:
+                for row in stuck_jobs:
+                    job_id = row[0]
+                    worker_id = row[1] or 'unknown'
+                    heartbeat = row[2] or 'never'
+                    print(f"  Recovering stuck job: {job_id} (worker={worker_id}, last_heartbeat={heartbeat})")
+
+                conn.execute("""
+                    UPDATE jobs
+                    SET JOBSCHEDULER_STATUS = 'pending',
+                        JOBSCHEDULER_STARTED_AT = NULL,
+                        JOBSCHEDULER_HEARTBEAT = NULL,
+                        JOBSCHEDULER_WORKER_ID = NULL
+                    WHERE JOBSCHEDULER_STATUS = 'running'
+                    AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                         OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+                """, (self.stale_threshold,))
+                conn.commit()
+                print(f"[Recovery] Reset {len(stuck_jobs)} stuck job(s) to 'pending' (heartbeat threshold: {self.stale_threshold}s)")
+            return len(stuck_jobs)
+
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Failed to recover stuck jobs: {e}", file=sys.stderr)
+            return 0
+        finally:
+            conn.close()
+
     def print_progress(self, clear_screen: bool = False):
         """Print current progress"""
+        if self.auto_recover:
+            self.recover_stuck_jobs()
+
         if clear_screen:
             # Clear screen (ANSI escape code)
             print("\033[2J\033[H", end="")
@@ -286,13 +336,18 @@ def main():
                        help='Continuous monitoring mode (updates every 2 seconds)')
     parser.add_argument('--interval', type=int, default=2,
                        help='Update interval in seconds for watch mode (default: 2)')
+    parser.add_argument('--no-recover', action='store_true',
+                       help='Disable automatic recovery of stuck jobs')
+    parser.add_argument('--stale-threshold', type=int, default=120,
+                       help='Seconds before a running job is considered stuck (default: 120)')
 
     args = parser.parse_args()
 
     if not Path(args.db_file).exists():
         sys.exit(f"Error: Database file does not exist: {args.db_file}")
 
-    viewer = ProgressViewer(args.db_file)
+    viewer = ProgressViewer(args.db_file, stale_threshold=args.stale_threshold,
+                            auto_recover=not args.no_recover)
 
     if args.watch:
         viewer.watch_mode(interval=args.interval)

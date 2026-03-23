@@ -203,15 +203,16 @@ progress_viewer jobs.db
 ### Q: 途中でジョブが止まった
 
 ```bash
-# スケジューラを起動すると、ハートビートが2分以上途絶えたジョブは自動的にpendingに戻ります
-# アクティブなワーカーのジョブは保護されるため、安全に新しいワーカーを追加できます
+# progress_viewer や db_util stats を実行すると自動的にリカバリされます
+# （ハートビートが2分以上途絶えたジョブのみ。アクティブなワーカーのジョブは保護）
+progress_viewer jobs.db
+db_util stats jobs.db
+
+# job_scheduler 起動時にもリカバリされます
 job_scheduler jobs.db "bash run.sh"
 
-# 手動でリセットする場合（全runningジョブをpendingに戻す）
+# 手動で全runningジョブをpendingに戻す場合
 db_util reset jobs.db
-
-# エラージョブのみリセット
-db_util reset jobs.db --status error
 ```
 
 ### Q: 依存ジョブがエラーでブロックされている

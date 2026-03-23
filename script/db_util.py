@@ -150,9 +150,9 @@ class JobDatabase:
         # Import rows
         imported = 0
         job_ids = []
-        for row in rows:
+        for i, row in enumerate(rows):
             # Generate job_id if not present
-            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{imported:08d}")
+            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{i:08d}")
             job_ids.append(job_id)
 
             # Set default values
@@ -182,8 +182,8 @@ class JobDatabase:
         self.conn.execute(f"DELETE FROM job_dependencies WHERE job_id IN ({placeholders})", job_ids)
 
         # Parse and insert dependencies
-        for row in rows:
-            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{rows.index(row):08d}")
+        for i, row in enumerate(rows):
+            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{i:08d}")
             depends_on = row.get('JOBSCHEDULER_DEPENDS_ON', '').strip()
 
             if depends_on:
@@ -270,9 +270,9 @@ class JobDatabase:
         # Import rows
         imported = 0
         skipped = 0
-        for row in rows:
+        for i, row in enumerate(rows):
             # Generate job_id if not present
-            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{imported:08d}")
+            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{i:08d}")
 
             # Check for duplicates
             if job_id in existing_ids:
@@ -362,6 +362,46 @@ class JobDatabase:
         )
         return cursor.fetchone() is not None
 
+    def recover_stuck_jobs(self, stale_threshold: int = 120) -> int:
+        """Recover jobs stuck in 'running' state with stale or missing heartbeat.
+
+        Returns the number of jobs recovered.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+
+        cursor = self.conn.execute("""
+            SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID, JOBSCHEDULER_HEARTBEAT
+            FROM jobs
+            WHERE JOBSCHEDULER_STATUS = 'running'
+            AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                 OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+        """, (stale_threshold,))
+        stuck_jobs = cursor.fetchall()
+
+        if stuck_jobs:
+            for row in stuck_jobs:
+                job_id = row[0]
+                worker_id = row[1] or 'unknown'
+                heartbeat = row[2] or 'never'
+                print(f"  Recovering stuck job: {job_id} (worker={worker_id}, last_heartbeat={heartbeat})")
+
+            self.conn.execute("""
+                UPDATE jobs
+                SET JOBSCHEDULER_STATUS = 'pending',
+                    JOBSCHEDULER_STARTED_AT = NULL,
+                    JOBSCHEDULER_HEARTBEAT = NULL,
+                    JOBSCHEDULER_WORKER_ID = NULL
+                WHERE JOBSCHEDULER_STATUS = 'running'
+                AND (JOBSCHEDULER_HEARTBEAT IS NULL
+                     OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+            """, (stale_threshold,))
+            self.conn.commit()
+            print(f"[Recovery] Reset {len(stuck_jobs)} stuck job(s) to 'pending' (heartbeat threshold: {stale_threshold}s)")
+        else:
+            self.conn.commit()
+
+        return len(stuck_jobs)
+
     def get_stats(self) -> Dict[str, int]:
         """Get job statistics"""
         if not self.table_exists():
@@ -410,11 +450,16 @@ def main():
     # stats: db_file
     stats_parser = subparsers.add_parser('stats', help='Show job statistics')
     stats_parser.add_argument('db_file', help='SQLite database file path')
+    stats_parser.add_argument('--no-recover', action='store_true',
+                              help='Disable automatic recovery of stuck jobs')
+    stats_parser.add_argument('--stale-threshold', type=int, default=120,
+                              help='Seconds before a running job is considered stuck (default: 120)')
 
-    # reset: db_file [--status STATUS]
+    # reset: db_file [--status STATUS] [--jobs JOB_IDS]
     reset_parser = subparsers.add_parser('reset', help='Reset jobs to pending status')
     reset_parser.add_argument('db_file', help='SQLite database file path')
     reset_parser.add_argument('--status', help='Reset only jobs with specific status')
+    reset_parser.add_argument('--jobs', help='Comma-separated job IDs to reset (e.g. job_00000000,job_00000001)')
 
     args = parser.parse_args()
 
@@ -449,6 +494,8 @@ def main():
         if not Path(args.db_file).exists():
             sys.exit(f"Error: Database file does not exist: {args.db_file}")
         with JobDatabase(args.db_file) as db:
+            if not args.no_recover:
+                db.recover_stuck_jobs(stale_threshold=args.stale_threshold)
             stats = db.get_stats()
             print("\nJob Statistics:")
             print(f"  Total: {stats.get('total', 0)}")
@@ -464,30 +511,56 @@ def main():
         with JobDatabase(args.db_file) as db:
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
-            if args.status:
-                # Reset only jobs with specific status
-                db.conn.execute("""
-                    UPDATE jobs
+
+            RESET_FIELDS = """
                     SET JOBSCHEDULER_STATUS = 'pending',
                         JOBSCHEDULER_STARTED_AT = NULL,
                         JOBSCHEDULER_FINISHED_AT = NULL,
                         JOBSCHEDULER_ELAPSED_TIME = NULL,
-                        JOBSCHEDULER_ERROR_MESSAGE = NULL
-                    WHERE JOBSCHEDULER_STATUS = ?
-                """, (args.status,))
+                        JOBSCHEDULER_ERROR_MESSAGE = NULL,
+                        JOBSCHEDULER_HEARTBEAT = NULL,
+                        JOBSCHEDULER_WORKER_ID = NULL"""
+
+            if args.jobs:
+                job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()]
+                placeholders = ','.join('?' * len(job_ids))
+                conditions = [f"JOBSCHEDULER_JOB_ID IN ({placeholders})"]
+                params = job_ids[:]
+                if args.status:
+                    conditions.append("JOBSCHEDULER_STATUS = ?")
+                    params.append(args.status)
+                where = " AND ".join(conditions)
+                db.conn.execute(
+                    f"UPDATE jobs{RESET_FIELDS} WHERE {where}",
+                    params
+                )
+                db.conn.commit()
+                count = db.conn.total_changes
+                # Warn about IDs not found
+                cursor = db.conn.execute(
+                    f"SELECT JOBSCHEDULER_JOB_ID FROM jobs WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})",
+                    job_ids
+                )
+                found_ids = {row[0] for row in cursor.fetchall()}
+                missing = [jid for jid in job_ids if jid not in found_ids]
+                if args.status:
+                    print(f"✓ Reset {count} jobs (from {len(job_ids)} specified IDs, status='{args.status}') to pending")
+                else:
+                    print(f"✓ Reset {count} of {len(job_ids)} specified jobs to pending")
+                for jid in missing:
+                    print(f"  Warning: job ID not found: {jid}")
+            elif args.status:
+                # Reset only jobs with specific status
+                db.conn.execute(
+                    f"UPDATE jobs{RESET_FIELDS} WHERE JOBSCHEDULER_STATUS = ?",
+                    (args.status,)
+                )
                 db.conn.commit()
                 count = db.conn.total_changes
                 print(f"✓ Reset {count} jobs with status '{args.status}' to pending")
             else:
                 # Reset all jobs to pending
-                db.conn.execute("""
-                    UPDATE jobs
-                    SET JOBSCHEDULER_STATUS = 'pending',
-                        JOBSCHEDULER_STARTED_AT = NULL,
-                        JOBSCHEDULER_FINISHED_AT = NULL,
-                        JOBSCHEDULER_ELAPSED_TIME = NULL,
-                        JOBSCHEDULER_ERROR_MESSAGE = NULL
-                """)
+                db.conn.execute(f"UPDATE jobs{RESET_FIELDS}")
                 db.conn.commit()
                 count = db.conn.total_changes
                 print(f"✓ Reset {count} jobs to pending status")

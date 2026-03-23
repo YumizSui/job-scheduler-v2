@@ -340,7 +340,7 @@ class JobScheduler:
 
             stop_event.wait(self.heartbeat_interval)
 
-    def run_job(self, job: Dict, max_time: float) -> Tuple[int, float, Optional[str]]:
+    def run_job(self, job: Dict, max_time: float, worker_id: int = 0) -> Tuple[int, float, Optional[str]]:
         """
         Execute a single job
 
@@ -362,12 +362,15 @@ class JobScheduler:
 
         try:
             # Start subprocess
+            env = os.environ.copy()
+            env['JOBSCHEDULER_PARALLEL_WORKER'] = str(worker_id)
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                env=env,
             )
 
             # Monitor output
@@ -485,7 +488,7 @@ class JobScheduler:
 
             # Run job
             job_id = job['JOBSCHEDULER_JOB_ID']
-            return_code, elapsed_time, error_message = self.run_job(job, available_time)
+            return_code, elapsed_time, error_message = self.run_job(job, available_time, worker_id)
 
             # Update job status
             if return_code == 0 and not shutdown_event.is_set():

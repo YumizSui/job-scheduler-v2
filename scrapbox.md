@@ -13,7 +13,7 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	優先度付きスケジューリング
 	マルチノード並列実行（qsubアレイジョブ対応）
 	進捗のリアルタイム監視（依存状態も表示）
-	中断しても自動復旧（実行中のジョブは保護）
+	中断しても自動復旧（progress_viewer・db_util stats実行時にも復旧。実行中のジョブは保護）
 	失敗したジョブだけ再実行
 	実行中に追加ワーカーを投入可能
 
@@ -55,6 +55,7 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	5. 進捗確認
 		`progress_viewer experiments.db --watch`
 		→ Ready/Waiting/Blocked の状態も表示
+		→ stuckジョブ（heartbeat2分超）を自動リカバリ（`--no-recover`で無効化）
 
 	6. 結果をエクスポート
 		`db_util export experiments.db` (自動的に experiments.csv にエクスポート)
@@ -72,6 +73,8 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 		code:bash
 		 # エラージョブのみリセット
 		 db_util reset experiments.db --status error
+		 # 特定ジョブのみリセット
+		 db_util reset experiments.db --jobs job_00000000,job_00000001
 		 job_scheduler experiments.db "bash run.sh"
 
 	既存DBにジョブを追加

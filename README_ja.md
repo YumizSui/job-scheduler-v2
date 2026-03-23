@@ -145,20 +145,29 @@ db_util export jobs.db
 db_util export jobs.db --csv-path done.csv --status done
 db_util export jobs.db --csv-path error.csv --status error
 
-# 統計表示
+# 統計表示（stuckジョブを自動リカバリ）
 db_util stats jobs.db
+
+# 統計表示（自動リカバリを無効化）
+db_util stats jobs.db --no-recover
 
 # すべてのジョブをpendingにリセット
 db_util reset jobs.db
 
 # エラージョブのみpendingにリセット
 db_util reset jobs.db --status error
+
+# 特定のジョブIDのみpendingにリセット
+db_util reset jobs.db --jobs job_00000000,job_00000001
+
+# 特定IDかつエラーのみリセット（両条件のAND）
+db_util reset jobs.db --jobs job_00000000,job_00000001 --status error
 ```
 
 ### 進捗監視
 
 ```bash
-# 1回だけ表示
+# 1回だけ表示（stuckジョブを自動リカバリ）
 progress_viewer jobs.db
 
 # リアルタイム監視（2秒ごとに更新）
@@ -166,6 +175,12 @@ progress_viewer jobs.db --watch
 
 # 更新間隔を変更
 progress_viewer jobs.db --watch --interval 5
+
+# 自動リカバリを無効化
+progress_viewer jobs.db --no-recover
+
+# stuckと判定する閾値を変更（デフォルト120秒）
+progress_viewer jobs.db --stale-threshold 300
 ```
 
 **進捗表示の見方**:
@@ -245,18 +260,22 @@ job_scheduler <db_file> <command> [options]
 - **busy_timeout=30秒**: ロック競合時は自動リトライ（最大3回）
 - **アトミック更新**: すべてのステータス変更はトランザクション内で実行
 - **ハートビート方式**: 実行中ジョブは30秒ごとに生存を通知
-- **Stuck Job Recovery**: 起動時にハートビートが2分以上途絶えたジョブのみを`pending`に復旧（アクティブなワーカーのジョブは保護）
+- **Stuck Job Recovery**: `job_scheduler` 起動時・`progress_viewer` 実行時・`db_util stats` 実行時に、ハートビートが2分以上途絶えたジョブのみを`pending`に自動復旧（アクティブなワーカーのジョブは保護）
 
 ## トラブルシューティング
 
 ### Q: ジョブが`running`状態で止まっている
 
 ```bash
-# スケジューラを起動すると、ハートビートが2分以上途絶えたジョブは自動的にpendingに戻ります
-# アクティブなワーカーのジョブは保護されるため、安全に新しいワーカーを追加できます
+# progress_viewer や db_util stats を実行すると自動的にリカバリされます
+# （ハートビートが2分以上途絶えたジョブのみ。アクティブなワーカーのジョブは保護）
+progress_viewer jobs.db
+db_util stats jobs.db
+
+# job_scheduler 起動時にもリカバリされます
 job_scheduler jobs.db "bash run.sh"
 
-# 手動でリセットする場合（全ジョブをpendingに戻す）
+# 手動で全ジョブをpendingにリセットする場合
 db_util reset jobs.db
 ```
 
@@ -279,6 +298,8 @@ progress_viewer jobs.db
 
 # エラージョブのみリセットして再実行
 db_util reset jobs.db --status error
+# 特定IDのジョブのみリセット
+db_util reset jobs.db --jobs job_00000000,job_00000001
 job_scheduler jobs.db "bash run.sh"
 ```
 
