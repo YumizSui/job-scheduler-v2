@@ -33,6 +33,7 @@ class JobDatabase:
         'JOBSCHEDULER_DEPENDS_ON',
         'JOBSCHEDULER_HEARTBEAT',
         'JOBSCHEDULER_WORKER_ID',
+        'JOBSCHEDULER_KILL_REQUESTED',
     }
 
     def __init__(self, db_path: str):
@@ -83,6 +84,7 @@ class JobDatabase:
             "JOBSCHEDULER_DEPENDS_ON TEXT",
             "JOBSCHEDULER_HEARTBEAT TEXT",
             "JOBSCHEDULER_WORKER_ID TEXT",
+            "JOBSCHEDULER_KILL_REQUESTED TEXT",
         ]
 
         # Add user columns
@@ -390,7 +392,8 @@ class JobDatabase:
                 SET JOBSCHEDULER_STATUS = 'pending',
                     JOBSCHEDULER_STARTED_AT = NULL,
                     JOBSCHEDULER_HEARTBEAT = NULL,
-                    JOBSCHEDULER_WORKER_ID = NULL
+                    JOBSCHEDULER_WORKER_ID = NULL,
+                    JOBSCHEDULER_KILL_REQUESTED = NULL
                 WHERE JOBSCHEDULER_STATUS = 'running'
                 AND (JOBSCHEDULER_HEARTBEAT IS NULL
                      OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
@@ -461,6 +464,11 @@ def main():
     reset_parser.add_argument('--status', help='Reset only jobs with specific status')
     reset_parser.add_argument('--jobs', help='Comma-separated job IDs to reset (e.g. job_00000000,job_00000001)')
 
+    # kill: db_file --jobs JOB_IDS
+    kill_parser = subparsers.add_parser('kill', help='Request termination of running jobs (marks for force kill)')
+    kill_parser.add_argument('db_file', help='SQLite database file path')
+    kill_parser.add_argument('--jobs', required=True, help='Comma-separated running job IDs to kill (e.g. job_00000000,job_00000001)')
+
     args = parser.parse_args()
 
     # Handle defaults for import
@@ -519,7 +527,8 @@ def main():
                         JOBSCHEDULER_ELAPSED_TIME = NULL,
                         JOBSCHEDULER_ERROR_MESSAGE = NULL,
                         JOBSCHEDULER_HEARTBEAT = NULL,
-                        JOBSCHEDULER_WORKER_ID = NULL"""
+                        JOBSCHEDULER_WORKER_ID = NULL,
+                        JOBSCHEDULER_KILL_REQUESTED = NULL"""
 
             if args.jobs:
                 job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()]
@@ -564,6 +573,46 @@ def main():
                 db.conn.commit()
                 count = db.conn.total_changes
                 print(f"✓ Reset {count} jobs to pending status")
+
+    # Handle kill
+    elif args.command == 'kill':
+        if not Path(args.db_file).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        with JobDatabase(args.db_file) as db:
+            if not db.table_exists():
+                sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
+
+            job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()]
+            if not job_ids:
+                sys.exit("Error: No job IDs specified.")
+
+            placeholders = ','.join('?' * len(job_ids))
+
+            # Check current status of specified jobs
+            cursor = db.conn.execute(
+                f"SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_STATUS FROM jobs WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})",
+                job_ids
+            )
+            rows = cursor.fetchall()
+            found = {row[0]: row[1] for row in rows}
+            missing = [jid for jid in job_ids if jid not in found]
+            for jid in missing:
+                print(f"  Warning: job ID not found: {jid}")
+            for jid, status in found.items():
+                if status != 'running':
+                    print(f"  Warning: {jid} is not running (status={status}), skipping")
+
+            # Mark running jobs for kill
+            db.conn.execute(
+                f"UPDATE jobs SET JOBSCHEDULER_KILL_REQUESTED = datetime('now') "
+                f"WHERE JOBSCHEDULER_JOB_ID IN ({placeholders}) AND JOBSCHEDULER_STATUS = 'running'",
+                job_ids
+            )
+            db.conn.commit()
+            killed_count = db.conn.total_changes
+            print(f"✓ Marked {killed_count} running job(s) for termination")
+            if killed_count > 0:
+                print("  The scheduler will detect the signal within the next heartbeat interval (default: 30s)")
 
 
 if __name__ == "__main__":

@@ -95,6 +95,9 @@ class JobScheduler:
         if 'JOBSCHEDULER_WORKER_ID' not in existing_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN JOBSCHEDULER_WORKER_ID TEXT")
 
+        if 'JOBSCHEDULER_KILL_REQUESTED' not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN JOBSCHEDULER_KILL_REQUESTED TEXT")
+
         return conn
 
     def get_pending_job(self, available_time: float) -> Optional[Dict]:
@@ -252,7 +255,8 @@ class JobScheduler:
                     SET JOBSCHEDULER_STATUS = 'pending',
                         JOBSCHEDULER_STARTED_AT = NULL,
                         JOBSCHEDULER_HEARTBEAT = NULL,
-                        JOBSCHEDULER_WORKER_ID = NULL
+                        JOBSCHEDULER_WORKER_ID = NULL,
+                        JOBSCHEDULER_KILL_REQUESTED = NULL
                     WHERE JOBSCHEDULER_STATUS = 'running'
                     AND (JOBSCHEDULER_HEARTBEAT IS NULL
                          OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
@@ -284,7 +288,8 @@ class JobScheduler:
                     JOBSCHEDULER_FINISHED_AT = datetime('now'),
                     JOBSCHEDULER_ERROR_MESSAGE = ?,
                     JOBSCHEDULER_HEARTBEAT = NULL,
-                    JOBSCHEDULER_WORKER_ID = NULL
+                    JOBSCHEDULER_WORKER_ID = NULL,
+                    JOBSCHEDULER_KILL_REQUESTED = NULL
                 WHERE JOBSCHEDULER_JOB_ID = ?
             """, (status, elapsed_time, error_message, job_id))
 
@@ -307,7 +312,8 @@ class JobScheduler:
             'JOBSCHEDULER_ESTIMATE_TIME', 'JOBSCHEDULER_ELAPSED_TIME',
             'JOBSCHEDULER_CREATED_AT', 'JOBSCHEDULER_STARTED_AT',
             'JOBSCHEDULER_FINISHED_AT', 'JOBSCHEDULER_ERROR_MESSAGE',
-            'JOBSCHEDULER_DEPENDS_ON', 'JOBSCHEDULER_HEARTBEAT', 'JOBSCHEDULER_WORKER_ID'
+            'JOBSCHEDULER_DEPENDS_ON', 'JOBSCHEDULER_HEARTBEAT', 'JOBSCHEDULER_WORKER_ID',
+            'JOBSCHEDULER_KILL_REQUESTED'
         }
 
         if self.named_args:
@@ -324,8 +330,8 @@ class JobScheduler:
 
         return cmd
 
-    def _heartbeat_worker(self, job_id: str, stop_event: Event):
-        """Background thread to update job heartbeat"""
+    def _heartbeat_worker(self, job_id: str, stop_event: Event, kill_event: Event):
+        """Background thread to update job heartbeat and detect kill requests"""
         while not stop_event.is_set():
             try:
                 conn = self.connect_db()
@@ -334,6 +340,14 @@ class JobScheduler:
                     (job_id,)
                 )
                 conn.commit()
+                cursor = conn.execute(
+                    "SELECT JOBSCHEDULER_KILL_REQUESTED FROM jobs WHERE JOBSCHEDULER_JOB_ID = ?",
+                    (job_id,)
+                )
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    logging.warning(f"Kill requested for job {job_id} (requested at {row[0]})")
+                    kill_event.set()
                 conn.close()
             except Exception as e:
                 logging.warning(f"Failed to update heartbeat for job {job_id}: {e}")
@@ -356,7 +370,8 @@ class JobScheduler:
 
         # Start heartbeat thread
         heartbeat_stop = Event()
-        heartbeat_thread = Thread(target=self._heartbeat_worker, args=(job_id, heartbeat_stop))
+        kill_event = Event()
+        heartbeat_thread = Thread(target=self._heartbeat_worker, args=(job_id, heartbeat_stop, kill_event))
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
 
@@ -398,7 +413,7 @@ class JobScheduler:
             end_time = start_time + max_time
             return_code = None
 
-            while process.poll() is None and not shutdown_event.is_set():
+            while process.poll() is None and not shutdown_event.is_set() and not kill_event.is_set():
                 if time.time() >= end_time:
                     logging.warning(f"Job {job_id} exceeded maximum runtime. Terminating.")
                     process.terminate()
@@ -413,7 +428,16 @@ class JobScheduler:
                 time.sleep(0.1)
 
             if return_code is None:
-                if shutdown_event.is_set():
+                if kill_event.is_set():
+                    logging.warning(f"Job {job_id} force kill requested. Terminating.")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return_code = -3
+                    error_message = "Force killed by user request"
+                elif shutdown_event.is_set():
                     process.terminate()
                     try:
                         process.wait(timeout=5)
@@ -497,6 +521,11 @@ class JobScheduler:
             elif return_code == -2 or shutdown_event.is_set():
                 # Timeout or interrupted - mark as pending for retry
                 self.mark_job_done(job_id, 'pending', elapsed_time, error_message)
+            elif return_code == -3:
+                # Force killed by user request
+                logging.warning(f"Job {job_id} was force killed. Marking as error.")
+                self.mark_job_done(job_id, 'error', elapsed_time, error_message)
+                self.jobs_failed += 1
             else:
                 self.mark_job_done(job_id, 'error', elapsed_time, error_message)
                 self.jobs_failed += 1

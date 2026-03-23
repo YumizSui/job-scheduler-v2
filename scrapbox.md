@@ -16,6 +16,7 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	中断しても自動復旧（progress_viewer・db_util stats実行時にも復旧。実行中のジョブは保護）
 	失敗したジョブだけ再実行
 	実行中に追加ワーカーを投入可能
+	実行中のジョブをIDで強制終了（errorステータスへ）
 
 [*** 基本的な使い方]
 	1. セットアップ
@@ -80,6 +81,12 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	既存DBにジョブを追加
 		code:bash
 		 db_util add experiments.db new_jobs.csv
+
+	実行中のジョブを強制終了
+		code:bash
+		 db_util kill experiments.db --jobs job_00000042
+		# schedulerが次のheartbeat（デフォルト30秒）で検知してerrorにする
+
 
 	時間制約のあるジョブ（24時間以内、最後5分はマージン）
 		`job_scheduler jobs.db "bash run.sh" --max-runtime 86400 --margin-time 300`

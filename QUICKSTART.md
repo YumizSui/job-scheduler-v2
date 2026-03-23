@@ -227,6 +227,16 @@ db_util reset jobs.db --status error
 job_scheduler jobs.db "bash run.sh"
 ```
 
+### Q: 実行中のジョブを止めたい
+
+```bash
+# 実行中ジョブのIDを確認
+progress_viewer jobs.db
+
+# 強制終了（schedulerが次のheartbeat時に検知、最大30秒後にerrorになる）
+db_util kill jobs.db --jobs job_00000042
+```
+
 ### Q: 並列実行してもあまり速くならない
 
 - SQLiteのロック競合が発生している可能性

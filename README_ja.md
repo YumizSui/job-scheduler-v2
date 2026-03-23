@@ -162,6 +162,10 @@ db_util reset jobs.db --jobs job_00000000,job_00000001
 
 # 特定IDかつエラーのみリセット（両条件のAND）
 db_util reset jobs.db --jobs job_00000000,job_00000001 --status error
+
+# 実行中のジョブを強制終了（errorステータスに変更）
+db_util kill jobs.db --jobs job_00000042
+db_util kill jobs.db --jobs job_00000042,job_00000043
 ```
 
 ### 進捗監視
@@ -228,6 +232,7 @@ job_scheduler <db_file> <command> [options]
 - `JOBSCHEDULER_ERROR_MESSAGE` - エラーメッセージ
 - `JOBSCHEDULER_HEARTBEAT` - ワーカーの最終生存確認時刻
 - `JOBSCHEDULER_WORKER_ID` - ワーカー識別子（hostname:PID）
+- `JOBSCHEDULER_KILL_REQUESTED` - 強制終了リクエストのタイムスタンプ（`db_util kill`でセット、終了後NULLにリセット）
 
 ## 動作の仕組み
 
@@ -301,6 +306,19 @@ db_util reset jobs.db --status error
 # 特定IDのジョブのみリセット
 db_util reset jobs.db --jobs job_00000000,job_00000001
 job_scheduler jobs.db "bash run.sh"
+```
+
+### Q: 実行中のジョブを止めたい
+
+```bash
+# 実行中のジョブIDを確認
+progress_viewer jobs.db
+
+# 強制終了（schedulerが次のheartbeat時に検知してerrorにする、最大30秒）
+db_util kill jobs.db --jobs job_00000042
+
+# 複数ジョブをまとめて強制終了
+db_util kill jobs.db --jobs job_00000042,job_00000043
 ```
 
 ### Q: データベースロックエラー
