@@ -1,6 +1,6 @@
 Job Scheduler v2
 #tsubame4
-2026/2/10更新
+2026/3/25更新
 
 [kfurui.icon] [JobScheduler]のsqlite3使った安全版（開発中）
 GitHubリポジトリ https://github.com/YumizSui/job-scheduler-v2
@@ -90,6 +90,10 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 
 	時間制約のあるジョブ（24時間以内、最後5分はマージン）
 		`job_scheduler jobs.db "bash run.sh" --max-runtime 86400 --margin-time 300`
+
+	推定実行時間が長いジョブを優先（LPT戦略、smart-schedulingと併用可）
+		`job_scheduler jobs.db "bash run.sh" --longest-first`
+		同一優先度内でESTIMATE_TIME降順に取得。長いジョブを先に流して短いジョブで隙間を埋める。
 
 	実行中にワーカーを追加
 		code:bash

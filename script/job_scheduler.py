@@ -56,6 +56,7 @@ class JobScheduler:
         self.margin_time = kwargs.get('margin_time', 0)
         self.speed_factor = kwargs.get('speed_factor', 1.0)
         self.smart_scheduling = kwargs.get('smart_scheduling', True)
+        self.longest_first = kwargs.get('longest_first', False)
         self.named_args = kwargs.get('named_args', False)
         self.parallel = kwargs.get('parallel', 1)
         self.dep_wait_interval = kwargs.get('dep_wait_interval', 30)
@@ -117,9 +118,11 @@ class JobScheduler:
                 conn.execute("BEGIN IMMEDIATE")
 
                 # Build query based on smart scheduling
+                order_by = "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_ESTIMATE_TIME DESC, JOBSCHEDULER_JOB_ID" if self.longest_first else "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID"
+
                 if self.smart_scheduling and available_time > 0:
                     # Only select jobs that can complete within available time
-                    query = """
+                    query = f"""
                         SELECT * FROM jobs
                         WHERE JOBSCHEDULER_STATUS = 'pending'
                         AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
@@ -129,13 +132,13 @@ class JobScheduler:
                             WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
                             AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
                         )
-                        ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
+                        ORDER BY {order_by}
                         LIMIT 1
                     """
                     cursor = conn.execute(query, (self.speed_factor, available_time))
                 else:
                     # Simple priority-based selection
-                    query = """
+                    query = f"""
                         SELECT * FROM jobs
                         WHERE JOBSCHEDULER_STATUS = 'pending'
                         AND NOT EXISTS (
@@ -144,7 +147,7 @@ class JobScheduler:
                             WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
                             AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
                         )
-                        ORDER BY JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID
+                        ORDER BY {order_by}
                         LIMIT 1
                     """
                     cursor = conn.execute(query)
@@ -542,6 +545,7 @@ class JobScheduler:
         logging.info(f"Margin time: {self.margin_time}s")
         logging.info(f"Speed factor: {self.speed_factor}")
         logging.info(f"Smart scheduling: {self.smart_scheduling}")
+        logging.info(f"Longest first: {self.longest_first}")
         logging.info(f"Named args: {self.named_args}")
         logging.info(f"Parallel: {self.parallel}")
         logging.info(f"Dependency wait interval: {self.dep_wait_interval}s")
@@ -618,6 +622,8 @@ Examples:
                        help='Speed factor for time estimation (default: 1.0)')
     parser.add_argument('--smart-scheduling', type=lambda x: x.lower() != 'false', default=True,
                        help='Enable smart scheduling based on estimate_time (default: true)')
+    parser.add_argument('--longest-first', action='store_true',
+                       help='Schedule longest estimated jobs first within same priority (LPT strategy, default: false)')
     parser.add_argument('--named-args', action='store_true',
                        help='Pass arguments as --key value instead of positional')
     parser.add_argument('--parallel', type=int, default=1,
@@ -644,6 +650,7 @@ Examples:
         margin_time=args.margin_time,
         speed_factor=args.speed_factor,
         smart_scheduling=args.smart_scheduling,
+        longest_first=args.longest_first,
         named_args=args.named_args,
         parallel=args.parallel,
         dep_wait_interval=args.dep_wait_interval,

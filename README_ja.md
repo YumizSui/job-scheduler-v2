@@ -209,6 +209,7 @@ job_scheduler <db_file> <command> [options]
   --margin-time SEC     安全マージン時間（秒）（デフォルト: 0）
   --speed-factor FLOAT  時間推定の速度係数（デフォルト: 1.0）
   --smart-scheduling    賢いスケジューリングを有効化（デフォルト: true）
+  --longest-first       同一優先度内で推定時間が長いジョブを優先（LPT戦略、デフォルト: false）
   --named-args          名前付き引数モード（--key value形式）
   --parallel N          並列実行数（デフォルト: 1）
   --dep-wait-interval SEC  依存待ち時の待機間隔（秒）（デフォルト: 30）
@@ -242,6 +243,7 @@ job_scheduler <db_file> <command> [options]
    - 依存ジョブが全て`done`になっているジョブのみ選択
    - `JOBSCHEDULER_PRIORITY`の降順でソート
    - `smart-scheduling=true`の場合、残り時間内に収まるジョブのみ選択
+   - `--longest-first`の場合、同一優先度内で`JOBSCHEDULER_ESTIMATE_TIME`の降順でソート（LPT戦略）
 
 2. **ステータス更新**: `running`に変更、`JOBSCHEDULER_STARTED_AT`を記録
 
