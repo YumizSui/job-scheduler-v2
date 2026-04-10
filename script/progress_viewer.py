@@ -25,8 +25,9 @@ class ProgressViewer:
 
     def connect_db(self) -> sqlite3.Connection:
         """Create database connection"""
-        conn = sqlite3.connect(self.db_path, timeout=5)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=DELETE")
         return conn
 
     def get_stats(self) -> Dict[str, int]:

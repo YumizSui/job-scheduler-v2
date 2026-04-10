@@ -55,8 +55,7 @@ class JobDatabase:
         self.conn = sqlite3.connect(self.db_path, timeout=30)
         self.conn.row_factory = sqlite3.Row  # Allow dict-like access
 
-        # Enable WAL mode for better concurrency
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA journal_mode=DELETE")
         self.conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
         self.conn.execute("PRAGMA synchronous=NORMAL")  # Balance between safety and speed
 
