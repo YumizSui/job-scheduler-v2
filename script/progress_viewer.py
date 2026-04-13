@@ -173,47 +173,76 @@ class ProgressViewer:
     def recover_stuck_jobs(self) -> int:
         """Recover jobs stuck in 'running' state with stale or missing heartbeat.
 
+        Uses file-based heartbeat (mtime) as primary signal, falls back to the
+        DB heartbeat column for workers predating this change.
+
         Returns the number of jobs recovered.
         """
+        hb_dir = Path(self.db_path + ".heartbeat")
+        now = time.time()
+
+        conn = self.connect_db()
+        try:
+            cursor = conn.execute("""
+                SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID,
+                       CASE WHEN JOBSCHEDULER_HEARTBEAT IS NULL THEN 1
+                            WHEN JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds') THEN 1
+                            ELSE 0 END as db_stale
+                FROM jobs WHERE JOBSCHEDULER_STATUS = 'running'
+            """, (self.stale_threshold,))
+            running_jobs = cursor.fetchall()
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Failed to query running jobs: {e}", file=sys.stderr)
+            return 0
+        finally:
+            conn.close()
+
+        stuck_job_ids = []
+        for row in running_jobs:
+            job_id, worker_id, db_stale = row[0], (row[1] or 'unknown'), row[2]
+            hb_file = hb_dir / job_id
+            if hb_file.exists():
+                age = now - hb_file.stat().st_mtime
+                if age > self.stale_threshold:
+                    print(f"  Recovering stuck job: {job_id} (worker={worker_id}, heartbeat_age={age:.0f}s)")
+                    stuck_job_ids.append(job_id)
+            elif db_stale:
+                print(f"  Recovering stuck job: {job_id} (worker={worker_id}, no heartbeat file, db stale)")
+                stuck_job_ids.append(job_id)
+
+        if not stuck_job_ids:
+            return 0
+
+        placeholders = ','.join('?' * len(stuck_job_ids))
         conn = self.connect_db()
         try:
             conn.execute("BEGIN IMMEDIATE")
-
-            cursor = conn.execute("""
-                SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID, JOBSCHEDULER_HEARTBEAT
-                FROM jobs
-                WHERE JOBSCHEDULER_STATUS = 'running'
-                AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                     OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
-            """, (self.stale_threshold,))
-            stuck_jobs = cursor.fetchall()
-
-            if stuck_jobs:
-                for row in stuck_jobs:
-                    job_id = row[0]
-                    worker_id = row[1] or 'unknown'
-                    heartbeat = row[2] or 'never'
-                    print(f"  Recovering stuck job: {job_id} (worker={worker_id}, last_heartbeat={heartbeat})")
-
-                conn.execute("""
-                    UPDATE jobs
-                    SET JOBSCHEDULER_STATUS = 'pending',
-                        JOBSCHEDULER_STARTED_AT = NULL,
-                        JOBSCHEDULER_HEARTBEAT = NULL,
-                        JOBSCHEDULER_WORKER_ID = NULL
-                    WHERE JOBSCHEDULER_STATUS = 'running'
-                    AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                         OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
-                """, (self.stale_threshold,))
-                conn.commit()
-                print(f"[Recovery] Reset {len(stuck_jobs)} stuck job(s) to 'pending' (heartbeat threshold: {self.stale_threshold}s)")
-            return len(stuck_jobs)
-
+            conn.execute(f"""
+                UPDATE jobs
+                SET JOBSCHEDULER_STATUS = 'pending',
+                    JOBSCHEDULER_STARTED_AT = NULL,
+                    JOBSCHEDULER_HEARTBEAT = NULL,
+                    JOBSCHEDULER_WORKER_ID = NULL,
+                    JOBSCHEDULER_KILL_REQUESTED = NULL
+                WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+                AND JOBSCHEDULER_STATUS = 'running'
+            """, stuck_job_ids)
+            conn.commit()
+            print(f"[Recovery] Reset {len(stuck_job_ids)} stuck job(s) to 'pending' (heartbeat threshold: {self.stale_threshold}s)")
         except sqlite3.OperationalError as e:
             print(f"Warning: Failed to recover stuck jobs: {e}", file=sys.stderr)
             return 0
         finally:
             conn.close()
+
+        for job_id in stuck_job_ids:
+            try:
+                (hb_dir / job_id).unlink(missing_ok=True)
+                (hb_dir / f"{job_id}.kill").unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        return len(stuck_job_ids)
 
     def print_progress(self, clear_screen: bool = False):
         """Print current progress"""
@@ -280,14 +309,18 @@ class ProgressViewer:
                 worker_id = job.get('JOBSCHEDULER_WORKER_ID', 'unknown')
                 heartbeat = job.get('JOBSCHEDULER_HEARTBEAT')
 
-                # Calculate heartbeat age
-                if heartbeat:
+                # Calculate heartbeat age from file mtime (primary) or DB column (fallback)
+                hb_file = Path(self.db_path + ".heartbeat") / job_id
+                if hb_file.exists():
+                    age_seconds = int(time.time() - hb_file.stat().st_mtime)
+                    heartbeat_info = f"heartbeat={age_seconds}s ago"
+                elif heartbeat:
                     try:
                         heartbeat_dt = datetime.fromisoformat(heartbeat)
-                        now = datetime.utcnow()
-                        age_seconds = int((now - heartbeat_dt).total_seconds())
-                        heartbeat_info = f"heartbeat={age_seconds}s ago"
-                    except:
+                        now_dt = datetime.utcnow()
+                        age_seconds = int((now_dt - heartbeat_dt).total_seconds())
+                        heartbeat_info = f"heartbeat={age_seconds}s ago (db)"
+                    except Exception:
                         heartbeat_info = f"heartbeat={heartbeat}"
                 else:
                     heartbeat_info = "heartbeat=never"
