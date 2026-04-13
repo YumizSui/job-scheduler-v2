@@ -78,6 +78,17 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 		 db_util reset experiments.db --jobs job_00000000,job_00000001
 		 job_scheduler experiments.db "bash run.sh"
 
+	特定ジョブを優先実行（完了後は通常スケジューリング）
+		`job_scheduler experiments.db "bash run.sh" --jobs job_00000001,job_00000002`
+
+	特定ジョブのみ実行して終了
+		`job_scheduler experiments.db "bash run.sh" --jobs job_00000001,job_00000002 --jobs-only`
+
+	ジョブをdone/errorに直接設定（外部で完了済みとしてスキップする場合など）
+		code:bash
+		 db_util reset experiments.db --set-status done --jobs job_00000005
+		 db_util reset experiments.db --set-status error --status running
+
 	既存DBにジョブを追加
 		code:bash
 		 db_util add experiments.db new_jobs.csv

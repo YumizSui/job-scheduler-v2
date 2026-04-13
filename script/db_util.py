@@ -457,11 +457,14 @@ def main():
     stats_parser.add_argument('--stale-threshold', type=int, default=120,
                               help='Seconds before a running job is considered stuck (default: 120)')
 
-    # reset: db_file [--status STATUS] [--jobs JOB_IDS]
-    reset_parser = subparsers.add_parser('reset', help='Reset jobs to pending status')
+    # reset: db_file [--status STATUS] [--jobs JOB_IDS] [--set-status STATUS]
+    reset_parser = subparsers.add_parser('reset', help='Reset jobs to a target status (default: pending)')
     reset_parser.add_argument('db_file', help='SQLite database file path')
-    reset_parser.add_argument('--status', help='Reset only jobs with specific status')
+    reset_parser.add_argument('--status', help='Filter: only reset jobs currently in this status (pending/running/done/error)')
     reset_parser.add_argument('--jobs', help='Comma-separated job IDs to reset (e.g. job_00000000,job_00000001)')
+    reset_parser.add_argument('--set-status', dest='set_status', default='pending',
+                              choices=['pending', 'done', 'error'],
+                              help='Target status to set jobs to (default: pending)')
 
     # kill: db_file --jobs JOB_IDS
     kill_parser = subparsers.add_parser('kill', help='Request termination of running jobs (marks for force kill)')
@@ -519,12 +522,24 @@ def main():
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
 
-            RESET_FIELDS = """
-                    SET JOBSCHEDULER_STATUS = 'pending',
+            set_status = args.set_status  # 'pending', 'done', or 'error'
+
+            if set_status == 'pending':
+                # Full reset: clear all runtime fields
+                SET_CLAUSE = """
+                    SET JOBSCHEDULER_STATUS = ?,
                         JOBSCHEDULER_STARTED_AT = NULL,
                         JOBSCHEDULER_FINISHED_AT = NULL,
                         JOBSCHEDULER_ELAPSED_TIME = NULL,
                         JOBSCHEDULER_ERROR_MESSAGE = NULL,
+                        JOBSCHEDULER_HEARTBEAT = NULL,
+                        JOBSCHEDULER_WORKER_ID = NULL,
+                        JOBSCHEDULER_KILL_REQUESTED = NULL"""
+            else:
+                # done/error: clear running-state fields, set FINISHED_AT
+                SET_CLAUSE = """
+                    SET JOBSCHEDULER_STATUS = ?,
+                        JOBSCHEDULER_FINISHED_AT = datetime('now'),
                         JOBSCHEDULER_HEARTBEAT = NULL,
                         JOBSCHEDULER_WORKER_ID = NULL,
                         JOBSCHEDULER_KILL_REQUESTED = NULL"""
@@ -533,13 +548,13 @@ def main():
                 job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()]
                 placeholders = ','.join('?' * len(job_ids))
                 conditions = [f"JOBSCHEDULER_JOB_ID IN ({placeholders})"]
-                params = job_ids[:]
+                params = [set_status] + job_ids[:]
                 if args.status:
                     conditions.append("JOBSCHEDULER_STATUS = ?")
                     params.append(args.status)
                 where = " AND ".join(conditions)
                 db.conn.execute(
-                    f"UPDATE jobs{RESET_FIELDS} WHERE {where}",
+                    f"UPDATE jobs{SET_CLAUSE} WHERE {where}",
                     params
                 )
                 db.conn.commit()
@@ -552,26 +567,26 @@ def main():
                 found_ids = {row[0] for row in cursor.fetchall()}
                 missing = [jid for jid in job_ids if jid not in found_ids]
                 if args.status:
-                    print(f"✓ Reset {count} jobs (from {len(job_ids)} specified IDs, status='{args.status}') to pending")
+                    print(f"✓ Reset {count} jobs (from {len(job_ids)} specified IDs, status='{args.status}') to {set_status}")
                 else:
-                    print(f"✓ Reset {count} of {len(job_ids)} specified jobs to pending")
+                    print(f"✓ Reset {count} of {len(job_ids)} specified jobs to {set_status}")
                 for jid in missing:
                     print(f"  Warning: job ID not found: {jid}")
             elif args.status:
                 # Reset only jobs with specific status
                 db.conn.execute(
-                    f"UPDATE jobs{RESET_FIELDS} WHERE JOBSCHEDULER_STATUS = ?",
-                    (args.status,)
+                    f"UPDATE jobs{SET_CLAUSE} WHERE JOBSCHEDULER_STATUS = ?",
+                    (set_status, args.status)
                 )
                 db.conn.commit()
                 count = db.conn.total_changes
-                print(f"✓ Reset {count} jobs with status '{args.status}' to pending")
+                print(f"✓ Reset {count} jobs with status '{args.status}' to {set_status}")
             else:
-                # Reset all jobs to pending
-                db.conn.execute(f"UPDATE jobs{RESET_FIELDS}")
+                # Reset all jobs
+                db.conn.execute(f"UPDATE jobs{SET_CLAUSE}", (set_status,))
                 db.conn.commit()
                 count = db.conn.total_changes
-                print(f"✓ Reset {count} jobs to pending status")
+                print(f"✓ Reset {count} jobs to {set_status} status")
 
     # Handle kill
     elif args.command == 'kill':
@@ -601,7 +616,7 @@ def main():
                 if status != 'running':
                     print(f"  Warning: {jid} is not running (status={status}), skipping")
 
-            # Mark running jobs for kill
+            # Mark running jobs for kill in DB (backward compat for old workers)
             db.conn.execute(
                 f"UPDATE jobs SET JOBSCHEDULER_KILL_REQUESTED = datetime('now') "
                 f"WHERE JOBSCHEDULER_JOB_ID IN ({placeholders}) AND JOBSCHEDULER_STATUS = 'running'",
@@ -609,6 +624,18 @@ def main():
             )
             db.conn.commit()
             killed_count = db.conn.total_changes
+
+            # Also create .kill sentinel files for file-based heartbeat workers
+            running_ids = [jid for jid, status in found.items() if status == 'running']
+            if running_ids:
+                hb_dir = Path(args.db_file + ".heartbeat")
+                if hb_dir.exists():
+                    for jid in running_ids:
+                        try:
+                            (hb_dir / f"{jid}.kill").touch()
+                        except Exception as e:
+                            print(f"  Warning: failed to create kill sentinel for {jid}: {e}")
+
             print(f"✓ Marked {killed_count} running job(s) for termination")
             if killed_count > 0:
                 print("  The scheduler will detect the signal within the next heartbeat interval (default: 30s)")

@@ -163,6 +163,10 @@ db_util reset jobs.db --jobs job_00000000,job_00000001
 # 特定IDかつエラーのみリセット（両条件のAND）
 db_util reset jobs.db --jobs job_00000000,job_00000001 --status error
 
+# ジョブをdone/errorステータスに設定（スキップ済みとして扱うなど）
+db_util reset jobs.db --set-status done --jobs job_00000005
+db_util reset jobs.db --set-status error --status running
+
 # 実行中のジョブを強制終了（errorステータスに変更）
 db_util kill jobs.db --jobs job_00000042
 db_util kill jobs.db --jobs job_00000042,job_00000043
@@ -215,6 +219,8 @@ job_scheduler <db_file> <command> [options]
   --dep-wait-interval SEC  依存待ち時の待機間隔（秒）（デフォルト: 30）
   --heartbeat-interval SEC ハートビート更新間隔（秒）（デフォルト: 30）
   --stale-threshold SEC    stuck判定の閾値（秒）（デフォルト: 120）
+  --jobs JOB_IDS        カンマ区切りのジョブIDを最優先で実行。完了後は通常スケジューリングに移行
+  --jobs-only           --jobsで指定したジョブのみ実行して終了（--jobsと併用）
 ```
 
 ## 予約カラム名

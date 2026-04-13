@@ -36,6 +36,18 @@ logging.basicConfig(
 shutdown_event = Event()
 
 
+def _heartbeat_dir(db_path: str) -> Path:
+    """Return path to the heartbeat directory for a given DB file."""
+    return Path(db_path + ".heartbeat")
+
+
+def _ensure_heartbeat_dir(db_path: str) -> Path:
+    """Create heartbeat directory if it doesn't exist and return its path."""
+    d = _heartbeat_dir(db_path)
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
     logging.warning(f"Signal {signum} received. Shutting down gracefully...")
@@ -62,6 +74,8 @@ class JobScheduler:
         self.dep_wait_interval = kwargs.get('dep_wait_interval', 30)
         self.heartbeat_interval = kwargs.get('heartbeat_interval', 30)
         self.stale_threshold = kwargs.get('stale_threshold', 120)
+        self.target_jobs = kwargs.get('target_jobs', None)  # list of job IDs or None
+        self.jobs_only = kwargs.get('jobs_only', False)
 
         # Generate worker ID (hostname:PID)
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -101,11 +115,12 @@ class JobScheduler:
 
         return conn
 
-    def get_pending_job(self, available_time: float) -> Optional[Dict]:
+    def get_pending_job(self, available_time: float, target_job_ids: Optional[list] = None) -> Optional[Dict]:
         """
-        Get next pending job based on priority and estimate_time
+        Get next pending job based on priority and estimate_time.
 
-        Returns job dict or None if no suitable job available
+        If target_job_ids is given, only consider jobs with those IDs.
+        Returns job dict or None if no suitable job available.
         """
         max_retries = 3
         retry_delay = 1  # seconds
@@ -120,11 +135,20 @@ class JobScheduler:
                 # Build query based on smart scheduling
                 order_by = "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_ESTIMATE_TIME DESC, JOBSCHEDULER_JOB_ID" if self.longest_first else "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID"
 
+                # Build optional job ID filter
+                job_id_filter = ""
+                job_id_params: list = []
+                if target_job_ids:
+                    placeholders = ','.join('?' * len(target_job_ids))
+                    job_id_filter = f"AND JOBSCHEDULER_JOB_ID IN ({placeholders})"
+                    job_id_params = list(target_job_ids)
+
                 if self.smart_scheduling and available_time > 0:
                     # Only select jobs that can complete within available time
                     query = f"""
                         SELECT * FROM jobs
                         WHERE JOBSCHEDULER_STATUS = 'pending'
+                        {job_id_filter}
                         AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
                         AND NOT EXISTS (
                             SELECT 1 FROM job_dependencies d
@@ -135,12 +159,13 @@ class JobScheduler:
                         ORDER BY {order_by}
                         LIMIT 1
                     """
-                    cursor = conn.execute(query, (self.speed_factor, available_time))
+                    cursor = conn.execute(query, job_id_params + [self.speed_factor, available_time])
                 else:
                     # Simple priority-based selection
                     query = f"""
                         SELECT * FROM jobs
                         WHERE JOBSCHEDULER_STATUS = 'pending'
+                        {job_id_filter}
                         AND NOT EXISTS (
                             SELECT 1 FROM job_dependencies d
                             LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
@@ -150,7 +175,7 @@ class JobScheduler:
                         ORDER BY {order_by}
                         LIMIT 1
                     """
-                    cursor = conn.execute(query)
+                    cursor = conn.execute(query, job_id_params)
 
                 row = cursor.fetchone()
 
@@ -217,64 +242,84 @@ class JobScheduler:
     def recover_stuck_jobs(self):
         """
         Recover jobs stuck in 'running' state using heartbeat detection.
-        Only resets jobs whose heartbeat is older than stale_threshold or NULL.
-        This prevents resetting jobs that are actively running on other workers.
+
+        Primary: checks file mtime in the .heartbeat directory (one file per job,
+        updated every heartbeat_interval seconds via touch). This avoids SQLite
+        writes on GPFS which were causing DB corruption under multi-node load.
+
+        Fallback: if no heartbeat file exists, falls back to the DB heartbeat
+        column (covers old workers or cases where the file couldn't be created).
         """
+        hb_dir = _heartbeat_dir(self.db_path)
+        now = time.time()
+
+        # Read running jobs with DB-level staleness info (read-only, no IMMEDIATE lock)
         conn = self.connect_db()
-
         try:
-            conn.execute("BEGIN IMMEDIATE")
-
-            # Count stuck jobs (heartbeat is NULL or too old)
             cursor = conn.execute("""
-                SELECT COUNT(*) FROM jobs
-                WHERE JOBSCHEDULER_STATUS = 'running'
-                AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                     OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+                SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID,
+                       CASE WHEN JOBSCHEDULER_HEARTBEAT IS NULL THEN 1
+                            WHEN JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds') THEN 1
+                            ELSE 0 END as db_stale
+                FROM jobs WHERE JOBSCHEDULER_STATUS = 'running'
             """, (self.stale_threshold,))
-            stuck_count = cursor.fetchone()[0]
-
-            if stuck_count > 0:
-                logging.warning(f"Found {stuck_count} stuck jobs (heartbeat older than {self.stale_threshold}s). Resetting to 'pending'...")
-
-                # Get stuck job IDs for logging
-                cursor = conn.execute("""
-                    SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID, JOBSCHEDULER_HEARTBEAT
-                    FROM jobs
-                    WHERE JOBSCHEDULER_STATUS = 'running'
-                    AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                         OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
-                """, (self.stale_threshold,))
-
-                for row in cursor.fetchall():
-                    job_id = row[0]
-                    worker_id = row[1] or 'unknown'
-                    heartbeat = row[2] or 'never'
-                    logging.info(f"  Resetting stuck job: {job_id} (worker={worker_id}, last_heartbeat={heartbeat})")
-
-                # Reset stuck jobs to pending
-                conn.execute("""
-                    UPDATE jobs
-                    SET JOBSCHEDULER_STATUS = 'pending',
-                        JOBSCHEDULER_STARTED_AT = NULL,
-                        JOBSCHEDULER_HEARTBEAT = NULL,
-                        JOBSCHEDULER_WORKER_ID = NULL,
-                        JOBSCHEDULER_KILL_REQUESTED = NULL
-                    WHERE JOBSCHEDULER_STATUS = 'running'
-                    AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                         OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
-                """, (self.stale_threshold,))
-
-                conn.commit()
-                logging.info(f"✓ Reset {stuck_count} stuck jobs to 'pending'")
-            else:
-                logging.info("No stuck jobs found (all running jobs have recent heartbeats)")
-
+            running_jobs = cursor.fetchall()
         except sqlite3.OperationalError as e:
-            logging.error(f"Failed to recover stuck jobs: {e}")
-
+            logging.error(f"Failed to query running jobs: {e}")
+            return
         finally:
             conn.close()
+
+        stuck_job_ids = []
+        for row in running_jobs:
+            job_id, worker_id, db_stale = row[0], (row[1] or 'unknown'), row[2]
+            hb_file = hb_dir / job_id
+
+            if hb_file.exists():
+                age = now - hb_file.stat().st_mtime
+                if age > self.stale_threshold:
+                    logging.info(f"  Stuck: {job_id} (worker={worker_id}, heartbeat_age={age:.0f}s)")
+                    stuck_job_ids.append(job_id)
+            else:
+                # No heartbeat file — fall back to DB column
+                if db_stale:
+                    logging.info(f"  Stuck: {job_id} (worker={worker_id}, no heartbeat file, db heartbeat stale)")
+                    stuck_job_ids.append(job_id)
+
+        if not stuck_job_ids:
+            logging.info("No stuck jobs found (all running jobs have recent heartbeats)")
+            return
+
+        logging.warning(f"Found {len(stuck_job_ids)} stuck jobs (threshold={self.stale_threshold}s). Resetting to 'pending'...")
+
+        placeholders = ','.join('?' * len(stuck_job_ids))
+        conn = self.connect_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(f"""
+                UPDATE jobs
+                SET JOBSCHEDULER_STATUS = 'pending',
+                    JOBSCHEDULER_STARTED_AT = NULL,
+                    JOBSCHEDULER_HEARTBEAT = NULL,
+                    JOBSCHEDULER_WORKER_ID = NULL,
+                    JOBSCHEDULER_KILL_REQUESTED = NULL
+                WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+                AND JOBSCHEDULER_STATUS = 'running'
+            """, stuck_job_ids)
+            conn.commit()
+            logging.info(f"✓ Reset {len(stuck_job_ids)} stuck jobs to 'pending'")
+        except sqlite3.OperationalError as e:
+            logging.error(f"Failed to recover stuck jobs: {e}")
+        finally:
+            conn.close()
+
+        # Clean up heartbeat files for recovered jobs
+        for job_id in stuck_job_ids:
+            try:
+                (hb_dir / job_id).unlink(missing_ok=True)
+                (hb_dir / f"{job_id}.kill").unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def mark_job_done(self, job_id: str, status: str, elapsed_time: float,
                      error_message: Optional[str] = None):
@@ -334,28 +379,34 @@ class JobScheduler:
         return cmd
 
     def _heartbeat_worker(self, job_id: str, stop_event: Event, kill_event: Event):
-        """Background thread to update job heartbeat and detect kill requests"""
+        """Background thread to update job heartbeat and detect kill requests.
+
+        Uses file-based heartbeat (mtime update) instead of SQLite writes to
+        avoid DB contention on GPFS under multi-node concurrent access.
+        """
+        hb_file = _heartbeat_dir(self.db_path) / job_id
+        kill_file = _heartbeat_dir(self.db_path) / f"{job_id}.kill"
+
         while not stop_event.is_set():
             try:
-                conn = self.connect_db()
-                conn.execute(
-                    "UPDATE jobs SET JOBSCHEDULER_HEARTBEAT = datetime('now') WHERE JOBSCHEDULER_JOB_ID = ?",
-                    (job_id,)
-                )
-                conn.commit()
-                cursor = conn.execute(
-                    "SELECT JOBSCHEDULER_KILL_REQUESTED FROM jobs WHERE JOBSCHEDULER_JOB_ID = ?",
-                    (job_id,)
-                )
-                row = cursor.fetchone()
-                if row and row[0] is not None:
-                    logging.warning(f"Kill requested for job {job_id} (requested at {row[0]})")
-                    kill_event.set()
-                conn.close()
+                hb_file.touch()
             except Exception as e:
                 logging.warning(f"Failed to update heartbeat for job {job_id}: {e}")
 
+            try:
+                if kill_file.exists():
+                    logging.warning(f"Kill requested for job {job_id} (sentinel file detected)")
+                    kill_event.set()
+            except Exception as e:
+                logging.warning(f"Failed to check kill request for job {job_id}: {e}")
+
             stop_event.wait(self.heartbeat_interval)
+
+        # Clean up heartbeat file when the thread stops normally
+        try:
+            hb_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def run_job(self, job: Dict, max_time: float, worker_id: int = 0) -> Tuple[int, float, Optional[str]]:
         """
@@ -370,6 +421,14 @@ class JobScheduler:
 
         start_time = time.time()
         error_message = None
+
+        # Create heartbeat file so the job is immediately visible to recover_stuck_jobs
+        hb_dir = _ensure_heartbeat_dir(self.db_path)
+        hb_file = hb_dir / job_id
+        try:
+            hb_file.write_text(self.worker_id)
+        except Exception as e:
+            logging.warning(f"Failed to create heartbeat file for {job_id}: {e}")
 
         # Start heartbeat thread
         heartbeat_stop = Event()
@@ -470,14 +529,51 @@ class JobScheduler:
             return -1, elapsed_time, error_message
 
         finally:
-            # Stop heartbeat thread
+            # Stop heartbeat thread (it will delete hb_file on exit)
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2)
+            # Ensure cleanup even if the thread didn't exit cleanly
+            try:
+                (hb_dir / job_id).unlink(missing_ok=True)
+                (hb_dir / f"{job_id}.kill").unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _cleanup_heartbeat_files(self):
+        """Remove heartbeat files for jobs that are no longer in 'running' state.
+
+        Called at startup to clean up files left by previously crashed workers.
+        """
+        hb_dir = _heartbeat_dir(self.db_path)
+        if not hb_dir.exists():
+            return
+
+        conn = self.connect_db()
+        try:
+            cursor = conn.execute(
+                "SELECT JOBSCHEDULER_JOB_ID FROM jobs WHERE JOBSCHEDULER_STATUS = 'running'"
+            )
+            running_ids = {row[0] for row in cursor.fetchall()}
+        except Exception:
+            return
+        finally:
+            conn.close()
+
+        for f in hb_dir.iterdir():
+            job_id = f.stem if f.suffix == '.kill' else f.name
+            if job_id not in running_ids:
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def run_scheduling_worker(self, worker_id: int = 0):
         """Single worker scheduling loop"""
         self.start_time = time.time()
         last_recovery_time = 0.0
+
+        # Track remaining target jobs (thread-safe copy; each worker operates on its own copy)
+        remaining_targets = list(self.target_jobs) if self.target_jobs else None
 
         while not shutdown_event.is_set():
             elapsed = time.time() - self.start_time
@@ -498,12 +594,40 @@ class JobScheduler:
                 self.recover_stuck_jobs()
                 last_recovery_time = now
 
+            # Determine job ID filter for this iteration
+            if remaining_targets is not None:
+                if len(remaining_targets) == 0:
+                    # All specified jobs have been picked up
+                    if self.jobs_only:
+                        if worker_id == 0 or self.parallel == 1:
+                            logging.info(f"Worker {worker_id}: All specified jobs dispatched (--jobs-only). Stopping.")
+                        break
+                    # Fall through to normal scheduling
+                    target_filter = None
+                else:
+                    target_filter = remaining_targets
+            else:
+                target_filter = None
+
             # Get next job
-            job = self.get_pending_job(available_time)
+            job = self.get_pending_job(available_time, target_job_ids=target_filter)
 
             if job is None:
+                if target_filter is not None:
+                    # Specified jobs not yet available (may be blocked by dependencies or time constraint)
+                    if self.has_blocked_pending_jobs():
+                        if worker_id == 0 or self.parallel == 1:
+                            logging.info(f"Worker {worker_id}: Target jobs not ready. Waiting {self.dep_wait_interval}s for dependencies...")
+                        time.sleep(self.dep_wait_interval)
+                        continue
+                    else:
+                        # Remaining targets are not pending (already done/error or non-existent) - skip them
+                        if worker_id == 0 or self.parallel == 1:
+                            logging.info(f"Worker {worker_id}: No ready target jobs. Skipping remaining: {remaining_targets}")
+                        remaining_targets = []
+                        continue
                 # Check if there are pending jobs waiting on dependencies
-                if self.has_blocked_pending_jobs():
+                elif self.has_blocked_pending_jobs():
                     if worker_id == 0 or self.parallel == 1:
                         logging.info(f"Worker {worker_id}: No ready jobs. Waiting {self.dep_wait_interval}s for dependencies...")
                     time.sleep(self.dep_wait_interval)
@@ -512,6 +636,12 @@ class JobScheduler:
                     if worker_id == 0 or self.parallel == 1:
                         logging.info(f"Worker {worker_id}: No suitable jobs available. Stopping.")
                     break
+
+            # Remove dispatched job from remaining targets
+            if remaining_targets is not None:
+                dispatched_id = job['JOBSCHEDULER_JOB_ID']
+                if dispatched_id in remaining_targets:
+                    remaining_targets.remove(dispatched_id)
 
             # Run job
             job_id = job['JOBSCHEDULER_JOB_ID']
@@ -553,9 +683,13 @@ class JobScheduler:
         logging.info(f"Stale threshold: {self.stale_threshold}s")
         logging.info("="*60)
 
-        # CRITICAL: Recover stuck jobs before starting
+        # Ensure heartbeat directory exists
+        _ensure_heartbeat_dir(self.db_path)
+
+        # CRITICAL: Recover stuck jobs before starting, then clean up stale files
         logging.info("Checking for stuck jobs...")
         self.recover_stuck_jobs()
+        self._cleanup_heartbeat_files()
 
         if self.parallel > 1:
             # Parallel mode: spawn multiple worker processes
@@ -608,6 +742,12 @@ Examples:
 
   # Parallel execution
   job_scheduler jobs.db "bash run.sh" --parallel 4
+
+  # Run specific jobs first, then continue with normal scheduling
+  job_scheduler jobs.db "bash run.sh" --jobs job_00000001,job_00000002
+
+  # Run only the specified jobs and stop
+  job_scheduler jobs.db "bash run.sh" --jobs job_00000001,job_00000002 --jobs-only
         """
     )
 
@@ -634,6 +774,11 @@ Examples:
                        help='Heartbeat update interval in seconds (default: 30)')
     parser.add_argument('--stale-threshold', type=int, default=120,
                        help='Threshold in seconds to consider a job stale/stuck (default: 120)')
+    parser.add_argument('--jobs',
+                       help='Comma-separated job IDs to prioritize (e.g. job_00000001,job_00000002). '
+                            'These jobs are run first; remaining pending jobs follow unless --jobs-only is set.')
+    parser.add_argument('--jobs-only', action='store_true',
+                       help='Only run the jobs specified by --jobs, then stop. Requires --jobs.')
 
     args = parser.parse_args()
 
@@ -641,6 +786,12 @@ Examples:
     if not os.path.exists(args.db_file):
         logging.error(f"Database file not found: {args.db_file}")
         sys.exit(1)
+
+    if args.jobs_only and not args.jobs:
+        logging.error("--jobs-only requires --jobs to be specified.")
+        sys.exit(1)
+
+    target_jobs = [j.strip() for j in args.jobs.split(',') if j.strip()] if args.jobs else None
 
     # Create scheduler
     scheduler = JobScheduler(
@@ -656,6 +807,8 @@ Examples:
         dep_wait_interval=args.dep_wait_interval,
         heartbeat_interval=args.heartbeat_interval,
         stale_threshold=args.stale_threshold,
+        target_jobs=target_jobs,
+        jobs_only=args.jobs_only,
     )
 
     # Run
