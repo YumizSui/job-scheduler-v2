@@ -221,6 +221,7 @@ job_scheduler <db_file> <command> [options]
   --stale-threshold SEC    stuck判定の閾値（秒）（デフォルト: 120）
   --jobs JOB_IDS        カンマ区切りのジョブIDを最優先で実行。完了後は通常スケジューリングに移行
   --jobs-only           --jobsで指定したジョブのみ実行して終了（--jobsと併用）
+  --log-stderr          ログ出力をstderrに切り替え（デフォルト: stdout）
 ```
 
 ## 予約カラム名

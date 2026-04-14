@@ -26,11 +26,15 @@ from threading import Event, Thread
 from multiprocessing import Process, Value
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+def setup_logging(use_stderr=False):
+    """Configure logging output destination."""
+    stream = sys.stderr if use_stderr else sys.stdout
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=stream,
+    )
 
 # Global shutdown event
 shutdown_event = Event()
@@ -779,8 +783,13 @@ Examples:
                             'These jobs are run first; remaining pending jobs follow unless --jobs-only is set.')
     parser.add_argument('--jobs-only', action='store_true',
                        help='Only run the jobs specified by --jobs, then stop. Requires --jobs.')
+    parser.add_argument('--log-stderr', action='store_true',
+                       help='Output logs to stderr instead of stdout (default: stdout)')
 
     args = parser.parse_args()
+
+    # Setup logging based on --log-stderr flag
+    setup_logging(use_stderr=args.log_stderr)
 
     # Validate
     if not os.path.exists(args.db_file):

@@ -106,6 +106,9 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 		`job_scheduler jobs.db "bash run.sh" --longest-first`
 		同一優先度内でESTIMATE_TIME降順に取得。長いジョブを先に流して短いジョブで隙間を埋める。
 
+	ログ出力をstderrに切り替える（デフォルトはstdout）
+		`job_scheduler jobs.db "bash run.sh" --log-stderr`
+
 	実行中にワーカーを追加
 		code:bash
 		 # すでに10ワーカーが動いていても、追加で5ワーカー投入OK
