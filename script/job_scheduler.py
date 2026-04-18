@@ -19,6 +19,7 @@ import time
 import signal
 import sys
 import os
+import random
 import socket
 import logging
 from typing import Optional, Dict, List, Tuple
@@ -126,97 +127,123 @@ class JobScheduler:
         If target_job_ids is given, only consider jobs with those IDs.
         Returns job dict or None if no suitable job available.
         """
-        max_retries = 3
-        retry_delay = 1  # seconds
+        max_retries = 5
 
-        for attempt in range(max_retries):
+        # Pre-attempt jitter: spread out simultaneous requests from many workers
+        time.sleep(random.uniform(0, 0.5))
+
+        # Build query (reused across attempts)
+        order_by = "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_ESTIMATE_TIME DESC, JOBSCHEDULER_JOB_ID" if self.longest_first else "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID"
+        job_id_filter = ""
+        job_id_params: list = []
+        if target_job_ids:
+            placeholders = ','.join('?' * len(target_job_ids))
+            job_id_filter = f"AND JOBSCHEDULER_JOB_ID IN ({placeholders})"
+            job_id_params = list(target_job_ids)
+
+        if self.smart_scheduling and available_time > 0:
+            select_query = f"""
+                SELECT * FROM jobs
+                WHERE JOBSCHEDULER_STATUS = 'pending'
+                {job_id_filter}
+                AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM job_dependencies d
+                    LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                    WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
+                    AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                )
+                ORDER BY {order_by}
+                LIMIT 1
+            """
+            select_params = job_id_params + [self.speed_factor, available_time]
+        else:
+            select_query = f"""
+                SELECT * FROM jobs
+                WHERE JOBSCHEDULER_STATUS = 'pending'
+                {job_id_filter}
+                AND NOT EXISTS (
+                    SELECT 1 FROM job_dependencies d
+                    LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                    WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
+                    AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
+                )
+                ORDER BY {order_by}
+                LIMIT 1
+            """
+            select_params = job_id_params
+
+        # Two independent counters:
+        #   lock_errors: DB-level SQLITE_BUSY/lock errors (expensive, use exponential backoff)
+        #   conflicts:   optimistic conflicts where another worker claimed the job first (cheap)
+        # Only lock_errors consume max_retries; conflicts are retried cheaply up to max_conflicts.
+        lock_errors = 0
+        conflicts = 0
+        max_conflicts = 20  # safety cap; 48 workers can't realistically all win before us
+
+        while True:
+            if lock_errors >= max_retries:
+                logging.warning(f"Database lock conflict after {max_retries} attempts. Giving up.")
+                return None
+            if conflicts >= max_conflicts:
+                logging.warning(f"Lost optimistic race {max_conflicts} times in a row. Giving up.")
+                return None
+
+            # Phase 1: Find candidate without holding any lock.
+            # The complex JOIN query runs here, outside the critical section.
             conn = self.connect_db()
-
             try:
-                # Start transaction with immediate lock
-                conn.execute("BEGIN IMMEDIATE")
-
-                # Build query based on smart scheduling
-                order_by = "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_ESTIMATE_TIME DESC, JOBSCHEDULER_JOB_ID" if self.longest_first else "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID"
-
-                # Build optional job ID filter
-                job_id_filter = ""
-                job_id_params: list = []
-                if target_job_ids:
-                    placeholders = ','.join('?' * len(target_job_ids))
-                    job_id_filter = f"AND JOBSCHEDULER_JOB_ID IN ({placeholders})"
-                    job_id_params = list(target_job_ids)
-
-                if self.smart_scheduling and available_time > 0:
-                    # Only select jobs that can complete within available time
-                    query = f"""
-                        SELECT * FROM jobs
-                        WHERE JOBSCHEDULER_STATUS = 'pending'
-                        {job_id_filter}
-                        AND (JOBSCHEDULER_ESTIMATE_TIME * 3600 / ?) <= ?
-                        AND NOT EXISTS (
-                            SELECT 1 FROM job_dependencies d
-                            LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
-                            WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
-                            AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
-                        )
-                        ORDER BY {order_by}
-                        LIMIT 1
-                    """
-                    cursor = conn.execute(query, job_id_params + [self.speed_factor, available_time])
-                else:
-                    # Simple priority-based selection
-                    query = f"""
-                        SELECT * FROM jobs
-                        WHERE JOBSCHEDULER_STATUS = 'pending'
-                        {job_id_filter}
-                        AND NOT EXISTS (
-                            SELECT 1 FROM job_dependencies d
-                            LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
-                            WHERE d.job_id = jobs.JOBSCHEDULER_JOB_ID
-                            AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS != 'done')
-                        )
-                        ORDER BY {order_by}
-                        LIMIT 1
-                    """
-                    cursor = conn.execute(query, job_id_params)
-
-                row = cursor.fetchone()
-
-                if row is None:
-                    conn.rollback()
-                    return None
-
-                # Convert to dict
-                job = dict(row)
-                job_id = job['JOBSCHEDULER_JOB_ID']
-
-                # Mark as running with heartbeat and worker_id
-                conn.execute("""
-                    UPDATE jobs
-                    SET JOBSCHEDULER_STATUS = 'running',
-                        JOBSCHEDULER_STARTED_AT = datetime('now'),
-                        JOBSCHEDULER_HEARTBEAT = datetime('now'),
-                        JOBSCHEDULER_WORKER_ID = ?
-                    WHERE JOBSCHEDULER_JOB_ID = ?
-                """, (self.worker_id, job_id))
-
-                conn.commit()
-                return job
-
+                row = conn.execute(select_query, select_params).fetchone()
             except sqlite3.OperationalError as e:
-                conn.rollback()
-                if attempt < max_retries - 1:
-                    logging.warning(f"Database lock conflict (attempt {attempt + 1}/{max_retries}): {e}")
-                    time.sleep(retry_delay)
-                else:
-                    logging.warning(f"Database lock conflict after {max_retries} attempts: {e}")
-                    return None
-
+                logging.warning(f"Failed to query pending jobs: {e}")
+                return None
             finally:
                 conn.close()
 
-        return None
+            if row is None:
+                # No pending jobs exist (not a race loss — genuinely empty).
+                return None
+
+            job = dict(row)
+            job_id = job['JOBSCHEDULER_JOB_ID']
+
+            # Phase 2: Claim the job with minimal lock window.
+            # Only a single-row PK check + update runs inside BEGIN IMMEDIATE.
+            conn = self.connect_db()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                still_pending = conn.execute(
+                    "SELECT 1 FROM jobs WHERE JOBSCHEDULER_JOB_ID = ? AND JOBSCHEDULER_STATUS = 'pending'",
+                    (job_id,)
+                ).fetchone()
+
+                if still_pending:
+                    conn.execute("""
+                        UPDATE jobs
+                        SET JOBSCHEDULER_STATUS = 'running',
+                            JOBSCHEDULER_STARTED_AT = datetime('now'),
+                            JOBSCHEDULER_HEARTBEAT = datetime('now'),
+                            JOBSCHEDULER_WORKER_ID = ?
+                        WHERE JOBSCHEDULER_JOB_ID = ?
+                    """, (self.worker_id, job_id))
+                    conn.commit()
+                    return job
+                else:
+                    # Another worker claimed this job between our SELECT and lock.
+                    conn.rollback()
+                    conflicts += 1
+                    # Small jitter before retrying with a fresh candidate.
+                    time.sleep(random.uniform(0, 0.3))
+
+            except sqlite3.OperationalError as e:
+                conn.rollback()
+                lock_errors += 1
+                backoff = random.uniform(0.5, 1.5) * (2 ** lock_errors)
+                logging.warning(f"Database lock conflict (lock_error {lock_errors}/{max_retries}): {e}, retry in {backoff:.1f}s")
+                time.sleep(backoff)
+
+            finally:
+                conn.close()
 
     def has_blocked_pending_jobs(self) -> bool:
         """
@@ -637,6 +664,20 @@ class JobScheduler:
                     time.sleep(self.dep_wait_interval)
                     continue
                 else:
+                    # Sanity check: confirm there are truly no pending jobs before stopping.
+                    # get_pending_job can return None due to repeated optimistic conflicts or
+                    # lock errors, not only because the queue is empty.
+                    conn = self.connect_db()
+                    try:
+                        remaining = conn.execute(
+                            "SELECT COUNT(*) FROM jobs WHERE JOBSCHEDULER_STATUS = 'pending'"
+                        ).fetchone()[0]
+                    finally:
+                        conn.close()
+                    if remaining > 0:
+                        logging.warning(f"Worker {worker_id}: get_pending_job returned None but {remaining} pending jobs exist. Retrying...")
+                        time.sleep(random.uniform(1, 3))
+                        continue
                     if worker_id == 0 or self.parallel == 1:
                         logging.info(f"Worker {worker_id}: No suitable jobs available. Stopping.")
                     break

@@ -264,16 +264,28 @@ class JobDatabase:
         if extra_in_csv:
             sys.exit(f"Error: CSV has columns not in DB: {extra_in_csv}")
 
-        # Get existing job IDs
+        # Get existing job IDs and compute next auto-ID offset
         existing_ids = {row[0] for row in self.conn.execute(
             "SELECT JOBSCHEDULER_JOB_ID FROM jobs").fetchall()}
+
+        # Compute max existing auto-generated index so new IDs don't collide
+        max_existing = -1
+        for eid in existing_ids:
+            if eid.startswith("job_") and eid[4:].isdigit():
+                max_existing = max(max_existing, int(eid[4:]))
+        next_id = max_existing + 1
 
         # Import rows
         imported = 0
         skipped = 0
-        for i, row in enumerate(rows):
+        auto_offset = 0
+        for row in rows:
             # Generate job_id if not present
-            job_id = row.get('JOBSCHEDULER_JOB_ID', f"job_{i:08d}")
+            if 'JOBSCHEDULER_JOB_ID' not in row or not row['JOBSCHEDULER_JOB_ID']:
+                job_id = f"job_{next_id + auto_offset:08d}"
+                auto_offset += 1
+            else:
+                job_id = row['JOBSCHEDULER_JOB_ID']
 
             # Check for duplicates
             if job_id in existing_ids:
