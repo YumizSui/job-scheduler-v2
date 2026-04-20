@@ -24,10 +24,14 @@ class ProgressViewer:
         self.auto_recover = auto_recover
 
     def connect_db(self) -> sqlite3.Connection:
-        """Create database connection"""
+        uri = f"file:{Path(self.db_path).resolve()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def connect_db_rw(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=DELETE")
         return conn
 
     def get_stats(self) -> Dict[str, int]:
@@ -214,7 +218,7 @@ class ProgressViewer:
             return 0
 
         placeholders = ','.join('?' * len(stuck_job_ids))
-        conn = self.connect_db()
+        conn = self.connect_db_rw()
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(f"""
