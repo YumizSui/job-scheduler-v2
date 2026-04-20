@@ -17,7 +17,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
 sys.path.insert(0, str(Path(__file__).parent))
 from db_util import JobDatabase
@@ -60,9 +60,9 @@ class ConfirmModal(ModalScreen[bool]):
     """Yes/No confirmation dialog."""
 
     BINDINGS = [
-        Binding("y", "confirm_yes", "Yes"),
-        Binding("n", "confirm_no", "No"),
-        Binding("escape", "confirm_no", "Cancel"),
+        Binding("y", "confirm_yes", "Yes", priority=True),
+        Binding("n", "confirm_no", "No", priority=True),
+        Binding("escape", "confirm_no", "Cancel", priority=True),
     ]
 
     def __init__(self, message: str) -> None:
@@ -72,9 +72,19 @@ class ConfirmModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         yield Vertical(
             Label(self._message, id="confirm-message"),
-            Label("[y] Yes    [n] No / Esc Cancel", id="confirm-keys"),
+            Horizontal(
+                Button("Yes (y)", id="confirm-yes", variant="error"),
+                Button("No (n)", id="confirm-no", variant="primary"),
+                id="confirm-buttons",
+            ),
             id="confirm-dialog",
         )
+
+    def on_mount(self) -> None:
+        self.query_one("#confirm-no", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-yes")
 
     def action_confirm_yes(self) -> None:
         self.dismiss(True)
@@ -135,6 +145,7 @@ class JobTUI(App):
     }
     #confirm-dialog {
         width: 50;
+        height: auto;
         padding: 2;
         border: solid $warning;
         background: $surface;
@@ -142,10 +153,14 @@ class JobTUI(App):
     #confirm-message {
         text-align: center;
         margin-bottom: 1;
+        width: 100%;
     }
-    #confirm-keys {
-        text-align: center;
-        color: $text-muted;
+    #confirm-buttons {
+        height: auto;
+        align: center middle;
+    }
+    #confirm-buttons Button {
+        margin: 0 1;
     }
     """
 
