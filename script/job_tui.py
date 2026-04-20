@@ -102,6 +102,8 @@ class DetailPanel(Static):
 
 
 class JobTUI(App):
+    SCROLL_SENSITIVITY_Y = 1
+
     CSS = """
     Screen {
         layout: vertical;
@@ -183,7 +185,7 @@ class JobTUI(App):
             detail = DetailPanel(id="detail-panel")
             detail.clear_job()
             yield detail
-        yield Input(placeholder="/ filter  status=X worker=Y or free text  [Enter] confirm  [Esc] back to table",
+        yield Input(placeholder="/ filter  status=running  priority>3  worker=node01  free text  [Esc] back",
                     id="filter-bar")
         yield Label("", id="status-bar")
         yield Footer()
@@ -237,9 +239,9 @@ class JobTUI(App):
             key_val = {}
             remainder_parts = []
             for token in ftext.split():
-                m = re.match(r'^(status|worker)=(.+)$', token, re.IGNORECASE)
+                m = re.match(r'^(status|worker|priority)(>=|<=|!=|>|<|=)(.+)$', token, re.IGNORECASE)
                 if m:
-                    key_val[m.group(1).lower()] = m.group(2)
+                    key_val[m.group(1).lower()] = (m.group(2), m.group(3))
                 else:
                     remainder_parts.append(token)
             remainder = " ".join(remainder_parts).lower()
@@ -248,15 +250,34 @@ class JobTUI(App):
                                if h == 'JOBSCHEDULER_STATUS'), None)
             worker_col = next((i for i, h in enumerate(self._headers)
                                if h == 'JOBSCHEDULER_WORKER_ID'), None)
+            priority_col = next((i for i, h in enumerate(self._headers)
+                                 if h == 'JOBSCHEDULER_PRIORITY'), None)
             error_col = next((i for i, h in enumerate(self._headers)
                               if h == 'JOBSCHEDULER_ERROR_MESSAGE'), None)
 
+            def _cmp(cell_val, op, target):
+                try:
+                    a, b = float(cell_val), float(target)
+                    return {'=': a == b, '!=': a != b, '>': a > b, '<': a < b,
+                            '>=': a >= b, '<=': a <= b}[op]
+                except (ValueError, TypeError):
+                    s = str(cell_val or '').lower()
+                    return {'=': s == target.lower(), '!=': s != target.lower(),
+                            '>': s > target.lower(), '<': s < target.lower(),
+                            '>=': s >= target.lower(), '<=': s <= target.lower()}[op]
+
             def row_matches(row):
                 if 'status' in key_val:
-                    if status_col is None or str(row[status_col] or '').lower() != key_val['status'].lower():
+                    op, val = key_val['status']
+                    if status_col is None or not _cmp(row[status_col], op, val):
                         return False
                 if 'worker' in key_val:
-                    if worker_col is None or key_val['worker'].lower() not in str(row[worker_col] or '').lower():
+                    op, val = key_val['worker']
+                    if worker_col is None or (op == '=' and val.lower() not in str(row[worker_col] or '').lower()):
+                        return False
+                if 'priority' in key_val:
+                    op, val = key_val['priority']
+                    if priority_col is None or not _cmp(row[priority_col], op, val):
                         return False
                 if remainder and error_col is not None:
                     try:
@@ -399,10 +420,10 @@ def main():
     parser.add_argument('db_path', help='SQLite database file path')
     parser.add_argument('--enable-actions', action='store_true',
                         help='Enable Ctrl+R (reset→pending) and Ctrl+K (kill) actions')
+    parser.add_argument('--auto-refresh', action='store_true',
+                        help='Enable auto-refresh (default: off; use r to refresh manually)')
     parser.add_argument('--refresh-interval', type=float, default=5.0,
                         help='Auto-refresh interval in seconds (default: 5.0)')
-    parser.add_argument('--no-auto-refresh', action='store_true',
-                        help='Disable auto-refresh; use r to refresh manually')
     args = parser.parse_args()
 
     if not Path(args.db_path).exists():
@@ -412,7 +433,7 @@ def main():
         db_path=args.db_path,
         enable_actions=args.enable_actions,
         refresh_interval=args.refresh_interval,
-        no_auto_refresh=args.no_auto_refresh,
+        no_auto_refresh=not args.auto_refresh,
     )
     app.run()
 
