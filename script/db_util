@@ -1,14 +1,15 @@
 #!/bin/bash
 # Database Utility - Bash wrapper script
 
-# Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Check if Python is available
-if ! command -v python3 &> /dev/null; then
+VENV_PY="$ROOT_DIR/.venv/bin/python"
+if [ -x "$VENV_PY" ]; then
+    exec "$VENV_PY" "$SCRIPT_DIR/db_util.py" "$@"
+elif command -v python3 &> /dev/null; then
+    exec python3 "$SCRIPT_DIR/db_util.py" "$@"
+else
     echo "Error: python3 not found" >&2
     exit 1
 fi
-
-# Run the database utility
-exec python3 "$SCRIPT_DIR/db_util.py" "$@"
