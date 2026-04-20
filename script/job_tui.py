@@ -175,8 +175,8 @@ class JobTUI(App):
 
         if enable_actions:
             self.BINDINGS = list(self.BINDINGS) + [
-                Binding("ctrl+r", "reset_job", "Reset→pending", priority=True),
-                Binding("ctrl+k", "kill_job", "Kill", priority=True),
+                Binding("R", "reset_job", "Reset→pending", priority=True),
+                Binding("K", "kill_job", "Kill", priority=True),
             ]
 
     def compose(self) -> ComposeResult:
