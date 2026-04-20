@@ -1,0 +1,14 @@
+[project]
+name = "job-scheduler-v2"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "rich>=15.0.0",
+    "textual>=8.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
