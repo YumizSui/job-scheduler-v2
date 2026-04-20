@@ -36,9 +36,10 @@ class JobDatabase:
         'JOBSCHEDULER_KILL_REQUESTED',
     }
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, read_only: bool = False):
         """Initialize database connection"""
         self.db_path = db_path
+        self.read_only = read_only
         self.conn = None
 
     def __enter__(self):
@@ -52,12 +53,15 @@ class JobDatabase:
 
     def connect(self):
         """Connect to database with optimized settings"""
-        self.conn = sqlite3.connect(self.db_path, timeout=30)
+        if self.read_only:
+            uri = f"file:{Path(self.db_path).resolve()}?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True, timeout=5)
+        else:
+            self.conn = sqlite3.connect(self.db_path, timeout=30)
+            self.conn.execute("PRAGMA journal_mode=DELETE")
+            self.conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
+            self.conn.execute("PRAGMA synchronous=NORMAL")  # Balance between safety and speed
         self.conn.row_factory = sqlite3.Row  # Allow dict-like access
-
-        self.conn.execute("PRAGMA journal_mode=DELETE")
-        self.conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
-        self.conn.execute("PRAGMA synchronous=NORMAL")  # Balance between safety and speed
 
     def close(self):
         """Close database connection"""
@@ -435,6 +439,278 @@ class JobDatabase:
 
         return stats
 
+    def _valid_columns(self) -> set:
+        """Return set of column names for the jobs table."""
+        cursor = self.conn.execute("PRAGMA table_info(jobs)")
+        return {row[1] for row in cursor.fetchall()}
+
+    def get_job(self, job_id: str) -> Optional[Dict]:
+        """Return all fields for a single job, or None if not found."""
+        if not self.table_exists():
+            return None
+        cursor = self.conn.execute(
+            "SELECT * FROM jobs WHERE JOBSCHEDULER_JOB_ID = ?", (job_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def get_dependencies(self, job_id: str):
+        """Return (depends_on_list, dependents_list) for a job."""
+        depends_on = [row[0] for row in self.conn.execute(
+            "SELECT depends_on FROM job_dependencies WHERE job_id = ?", (job_id,)
+        ).fetchall()]
+        dependents = [row[0] for row in self.conn.execute(
+            "SELECT job_id FROM job_dependencies WHERE depends_on = ?", (job_id,)
+        ).fetchall()]
+        return depends_on, dependents
+
+    def list_jobs(self, status=None, worker=None, grep_error=None, since=None, until=None,
+                  priority_min=None, priority_max=None, sort='JOBSCHEDULER_JOB_ID',
+                  limit=None, columns=None):
+        """Query jobs with filters. Returns (headers, rows)."""
+        if not self.table_exists():
+            raise RuntimeError("Database is not initialized.")
+
+        valid_cols = self._valid_columns()
+
+        if sort not in valid_cols:
+            raise ValueError(f"Invalid sort column: {sort!r}. Valid: {sorted(valid_cols)}")
+
+        if columns:
+            invalid = [c for c in columns if c not in valid_cols]
+            if invalid:
+                raise ValueError(f"Invalid columns: {invalid}. Valid: {sorted(valid_cols)}")
+            select_expr = ', '.join(columns)
+        else:
+            select_expr = '*'
+
+        if grep_error:
+            import re as _re
+            def _regexp(pattern, value):
+                if value is None:
+                    return False
+                try:
+                    return _re.search(pattern, value) is not None
+                except _re.error:
+                    return False
+            self.conn.create_function("REGEXP", 2, _regexp, deterministic=True)
+
+        conditions = []
+        params = []
+        if status:
+            conditions.append("JOBSCHEDULER_STATUS = ?")
+            params.append(status)
+        if worker:
+            conditions.append("JOBSCHEDULER_WORKER_ID = ?")
+            params.append(worker)
+        if grep_error:
+            conditions.append("JOBSCHEDULER_ERROR_MESSAGE REGEXP ?")
+            params.append(grep_error)
+        if since:
+            conditions.append("JOBSCHEDULER_CREATED_AT >= ?")
+            params.append(since)
+        if until:
+            conditions.append("JOBSCHEDULER_CREATED_AT <= ?")
+            params.append(until)
+        if priority_min is not None:
+            conditions.append("JOBSCHEDULER_PRIORITY >= ?")
+            params.append(priority_min)
+        if priority_max is not None:
+            conditions.append("JOBSCHEDULER_PRIORITY <= ?")
+            params.append(priority_max)
+
+        sql = f"SELECT {select_expr} FROM jobs"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += f" ORDER BY {sort}"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        cursor = self.conn.execute(sql, params)
+        rows = cursor.fetchall()
+        headers = [d[0] for d in cursor.description]
+        return headers, rows
+
+    def get_stats_by(self, dimension: str) -> list:
+        """Group job counts by status/worker/priority."""
+        dim_map = {
+            'status': 'JOBSCHEDULER_STATUS',
+            'worker': 'JOBSCHEDULER_WORKER_ID',
+            'priority': 'JOBSCHEDULER_PRIORITY',
+        }
+        if dimension not in dim_map:
+            raise ValueError(f"dimension must be one of {sorted(dim_map.keys())}")
+        col = dim_map[dimension]
+        cursor = self.conn.execute(f"""
+            SELECT {col} as dim,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN JOBSCHEDULER_STATUS='done' THEN 1 ELSE 0 END) as done,
+                   SUM(CASE WHEN JOBSCHEDULER_STATUS='error' THEN 1 ELSE 0 END) as error,
+                   SUM(CASE WHEN JOBSCHEDULER_STATUS='running' THEN 1 ELSE 0 END) as running,
+                   SUM(CASE WHEN JOBSCHEDULER_STATUS='pending' THEN 1 ELSE 0 END) as pending
+            FROM jobs
+            GROUP BY {col}
+            ORDER BY total DESC
+        """)
+        return cursor.fetchall()
+
+    def reset_jobs(self, job_ids: Optional[List[str]], status_filter: Optional[str], set_status: str):
+        """Reset jobs to set_status. Returns (count, missing_ids)."""
+        if set_status == 'pending':
+            SET_CLAUSE = """
+                SET JOBSCHEDULER_STATUS = ?,
+                    JOBSCHEDULER_STARTED_AT = NULL,
+                    JOBSCHEDULER_FINISHED_AT = NULL,
+                    JOBSCHEDULER_ELAPSED_TIME = NULL,
+                    JOBSCHEDULER_ERROR_MESSAGE = NULL,
+                    JOBSCHEDULER_HEARTBEAT = NULL,
+                    JOBSCHEDULER_WORKER_ID = NULL,
+                    JOBSCHEDULER_KILL_REQUESTED = NULL"""
+        else:
+            SET_CLAUSE = """
+                SET JOBSCHEDULER_STATUS = ?,
+                    JOBSCHEDULER_FINISHED_AT = datetime('now'),
+                    JOBSCHEDULER_HEARTBEAT = NULL,
+                    JOBSCHEDULER_WORKER_ID = NULL,
+                    JOBSCHEDULER_KILL_REQUESTED = NULL"""
+
+        if job_ids:
+            placeholders = ','.join('?' * len(job_ids))
+            conditions = [f"JOBSCHEDULER_JOB_ID IN ({placeholders})"]
+            params: List = [set_status] + list(job_ids)
+            if status_filter:
+                conditions.append("JOBSCHEDULER_STATUS = ?")
+                params.append(status_filter)
+            where = " AND ".join(conditions)
+            self.conn.execute(f"UPDATE jobs{SET_CLAUSE} WHERE {where}", params)
+            self.conn.commit()
+            count = self.conn.total_changes
+            found_ids = {row[0] for row in self.conn.execute(
+                f"SELECT JOBSCHEDULER_JOB_ID FROM jobs WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})",
+                job_ids
+            ).fetchall()}
+            missing = [jid for jid in job_ids if jid not in found_ids]
+            return count, missing
+        elif status_filter:
+            self.conn.execute(
+                f"UPDATE jobs{SET_CLAUSE} WHERE JOBSCHEDULER_STATUS = ?",
+                (set_status, status_filter)
+            )
+            self.conn.commit()
+            return self.conn.total_changes, []
+        else:
+            self.conn.execute(f"UPDATE jobs{SET_CLAUSE}", (set_status,))
+            self.conn.commit()
+            return self.conn.total_changes, []
+
+    def request_kill(self, job_ids: List[str]) -> int:
+        """Mark running jobs for kill via DB flag + sentinel file. Returns count."""
+        placeholders = ','.join('?' * len(job_ids))
+        found = {row[0]: row[1] for row in self.conn.execute(
+            f"SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_STATUS FROM jobs "
+            f"WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})", job_ids
+        ).fetchall()}
+        for jid in job_ids:
+            if jid not in found:
+                print(f"  Warning: job ID not found: {jid}")
+        for jid, status in found.items():
+            if status != 'running':
+                print(f"  Warning: {jid} is not running (status={status}), skipping")
+
+        self.conn.execute(
+            f"UPDATE jobs SET JOBSCHEDULER_KILL_REQUESTED = datetime('now') "
+            f"WHERE JOBSCHEDULER_JOB_ID IN ({placeholders}) AND JOBSCHEDULER_STATUS = 'running'",
+            job_ids
+        )
+        self.conn.commit()
+        killed_count = self.conn.total_changes
+
+        running_ids = [jid for jid, status in found.items() if status == 'running']
+        if running_ids:
+            hb_dir = Path(self.db_path + ".heartbeat")
+            if hb_dir.exists():
+                for jid in running_ids:
+                    try:
+                        (hb_dir / f"{jid}.kill").touch()
+                    except Exception as e:
+                        print(f"  Warning: failed to create kill sentinel for {jid}: {e}")
+
+        return killed_count
+
+
+# Default columns shown by `list` when --columns is not specified
+_LIST_DEFAULT_HIDDEN = {
+    'JOBSCHEDULER_HEARTBEAT', 'JOBSCHEDULER_KILL_REQUESTED',
+    'JOBSCHEDULER_DEPENDS_ON', 'JOBSCHEDULER_CREATED_AT',
+    'JOBSCHEDULER_STARTED_AT', 'JOBSCHEDULER_FINISHED_AT',
+    'JOBSCHEDULER_ESTIMATE_TIME',
+}
+
+
+def _require_rich():
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.text import Text
+        return Console(), Table, Panel, Text
+    except ImportError:
+        sys.exit("rich が必要です。uv sync を実行してください。")
+
+
+def _print_job_detail(job: dict, depends_on: list, dependents: list):
+    console, Table, Panel, Text = _require_rich()
+    table = Table("Field", "Value", show_header=True, header_style="bold cyan",
+                  show_lines=False, expand=True)
+    for key, value in job.items():
+        val_str = str(value) if value is not None else "-"
+        style = "dim" if key in JobDatabase.RESERVED_COLUMNS else "green"
+        if key == 'JOBSCHEDULER_ERROR_MESSAGE' and value:
+            val_text = Text(val_str, overflow="fold")
+            table.add_row(key, val_text, style=style)
+        else:
+            table.add_row(key, val_str, style=style)
+    console.print(table)
+    if depends_on:
+        console.print(Panel(", ".join(depends_on), title="Depends on", expand=False))
+    if dependents:
+        console.print(Panel(", ".join(dependents), title="Dependents", expand=False))
+
+
+def _print_job_list(headers: list, rows: list, display_columns: Optional[List[str]] = None):
+    console, Table, Panel, Text = _require_rich()
+    if display_columns:
+        col_indices = [i for i, h in enumerate(headers) if h in display_columns]
+        shown_headers = [headers[i] for i in col_indices]
+    else:
+        col_indices = [i for i, h in enumerate(headers) if h not in _LIST_DEFAULT_HIDDEN]
+        shown_headers = [headers[i] for i in col_indices]
+
+    short_headers = [h.replace('JOBSCHEDULER_', '') for h in shown_headers]
+
+    table = Table(*short_headers, show_header=True, header_style="bold cyan",
+                  row_styles=["", "dim"], expand=True)
+    for row in rows:
+        cells = []
+        for i in col_indices:
+            val = row[i] if row[i] is not None else "-"
+            cells.append(str(val))
+        table.add_row(*cells)
+    console.print(table)
+    console.print(f"[dim]{len(rows)} row(s)[/dim]")
+
+
+def _print_stats_by(rows: list, dimension: str):
+    console, Table, Panel, Text = _require_rich()
+    table = Table(dimension, "total", "done", "error", "running", "pending",
+                  show_header=True, header_style="bold cyan", expand=False)
+    for row in rows:
+        dim_val = str(row[0]) if row[0] is not None else "(null)"
+        table.add_row(dim_val, str(row[1]), str(row[2]), str(row[3]), str(row[4]), str(row[5]))
+    console.print(f"\n[bold]By {dimension}:[/bold]")
+    console.print(table)
+
 
 def main():
     """CLI interface"""
@@ -468,6 +744,28 @@ def main():
                               help='Disable automatic recovery of stuck jobs')
     stats_parser.add_argument('--stale-threshold', type=int, default=120,
                               help='Seconds before a running job is considered stuck (default: 120)')
+    stats_parser.add_argument('--by', choices=['status', 'worker', 'priority'],
+                              help='Show breakdown grouped by this dimension')
+
+    # show: job_id --db-path
+    show_parser = subparsers.add_parser('show', help='Show all fields of a single job')
+    show_parser.add_argument('job_id', help='Job ID to inspect')
+    show_parser.add_argument('--db-path', required=True, help='SQLite database file path')
+
+    # list: --db-path [filters]
+    list_parser = subparsers.add_parser('list', help='List jobs in a formatted table')
+    list_parser.add_argument('--db-path', required=True, help='SQLite database file path')
+    list_parser.add_argument('--status', help='Filter by status (pending/running/done/error)')
+    list_parser.add_argument('--worker', help='Filter by exact WORKER_ID')
+    list_parser.add_argument('--grep-error', help='Python regex filter on ERROR_MESSAGE')
+    list_parser.add_argument('--since', help='Minimum CREATED_AT (ISO timestamp)')
+    list_parser.add_argument('--until', help='Maximum CREATED_AT (ISO timestamp)')
+    list_parser.add_argument('--priority-min', type=int, help='Minimum PRIORITY (inclusive)')
+    list_parser.add_argument('--priority-max', type=int, help='Maximum PRIORITY (inclusive)')
+    list_parser.add_argument('--sort', default='JOBSCHEDULER_JOB_ID',
+                             help='Column to sort by (default: JOBSCHEDULER_JOB_ID)')
+    list_parser.add_argument('--limit', type=int, help='Maximum number of rows to show')
+    list_parser.add_argument('--columns', help='Comma-separated column names to display')
 
     # reset: db_file [--status STATUS] [--jobs JOB_IDS] [--set-status STATUS]
     reset_parser = subparsers.add_parser('reset', help='Reset jobs to a target status (default: pending)')
@@ -475,7 +773,7 @@ def main():
     reset_parser.add_argument('--status', help='Filter: only reset jobs currently in this status (pending/running/done/error)')
     reset_parser.add_argument('--jobs', help='Comma-separated job IDs to reset (e.g. job_00000000,job_00000001)')
     reset_parser.add_argument('--set-status', dest='set_status', default='pending',
-                              choices=['pending', 'done', 'error'],
+                              choices=['pending', 'done', 'error', 'running'],
                               help='Target status to set jobs to (default: pending)')
 
     # kill: db_file --jobs JOB_IDS
@@ -525,6 +823,9 @@ def main():
             print(f"  Running: {stats.get('running', 0)}")
             print(f"  Done: {stats.get('done', 0)}")
             print(f"  Error: {stats.get('error', 0)}")
+            if args.by:
+                rows = db.get_stats_by(args.by)
+                _print_stats_by(rows, args.by)
 
     # Handle reset
     elif args.command == 'reset':
@@ -533,72 +834,20 @@ def main():
         with JobDatabase(args.db_file) as db:
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
-
-            set_status = args.set_status  # 'pending', 'done', or 'error'
-
-            if set_status == 'pending':
-                # Full reset: clear all runtime fields
-                SET_CLAUSE = """
-                    SET JOBSCHEDULER_STATUS = ?,
-                        JOBSCHEDULER_STARTED_AT = NULL,
-                        JOBSCHEDULER_FINISHED_AT = NULL,
-                        JOBSCHEDULER_ELAPSED_TIME = NULL,
-                        JOBSCHEDULER_ERROR_MESSAGE = NULL,
-                        JOBSCHEDULER_HEARTBEAT = NULL,
-                        JOBSCHEDULER_WORKER_ID = NULL,
-                        JOBSCHEDULER_KILL_REQUESTED = NULL"""
-            else:
-                # done/error: clear running-state fields, set FINISHED_AT
-                SET_CLAUSE = """
-                    SET JOBSCHEDULER_STATUS = ?,
-                        JOBSCHEDULER_FINISHED_AT = datetime('now'),
-                        JOBSCHEDULER_HEARTBEAT = NULL,
-                        JOBSCHEDULER_WORKER_ID = NULL,
-                        JOBSCHEDULER_KILL_REQUESTED = NULL"""
-
-            if args.jobs:
-                job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()]
-                placeholders = ','.join('?' * len(job_ids))
-                conditions = [f"JOBSCHEDULER_JOB_ID IN ({placeholders})"]
-                params = [set_status] + job_ids[:]
-                if args.status:
-                    conditions.append("JOBSCHEDULER_STATUS = ?")
-                    params.append(args.status)
-                where = " AND ".join(conditions)
-                db.conn.execute(
-                    f"UPDATE jobs{SET_CLAUSE} WHERE {where}",
-                    params
-                )
-                db.conn.commit()
-                count = db.conn.total_changes
-                # Warn about IDs not found
-                cursor = db.conn.execute(
-                    f"SELECT JOBSCHEDULER_JOB_ID FROM jobs WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})",
-                    job_ids
-                )
-                found_ids = {row[0] for row in cursor.fetchall()}
-                missing = [jid for jid in job_ids if jid not in found_ids]
+            set_status = args.set_status
+            job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()] if args.jobs else None
+            count, missing = db.reset_jobs(job_ids, args.status, set_status)
+            if job_ids:
                 if args.status:
                     print(f"✓ Reset {count} jobs (from {len(job_ids)} specified IDs, status='{args.status}') to {set_status}")
                 else:
                     print(f"✓ Reset {count} of {len(job_ids)} specified jobs to {set_status}")
-                for jid in missing:
-                    print(f"  Warning: job ID not found: {jid}")
             elif args.status:
-                # Reset only jobs with specific status
-                db.conn.execute(
-                    f"UPDATE jobs{SET_CLAUSE} WHERE JOBSCHEDULER_STATUS = ?",
-                    (set_status, args.status)
-                )
-                db.conn.commit()
-                count = db.conn.total_changes
                 print(f"✓ Reset {count} jobs with status '{args.status}' to {set_status}")
             else:
-                # Reset all jobs
-                db.conn.execute(f"UPDATE jobs{SET_CLAUSE}", (set_status,))
-                db.conn.commit()
-                count = db.conn.total_changes
                 print(f"✓ Reset {count} jobs to {set_status} status")
+            for jid in missing:
+                print(f"  Warning: job ID not found: {jid}")
 
     # Handle kill
     elif args.command == 'kill':
@@ -607,50 +856,48 @@ def main():
         with JobDatabase(args.db_file) as db:
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
-
             job_ids = [j.strip() for j in args.jobs.split(',') if j.strip()]
             if not job_ids:
                 sys.exit("Error: No job IDs specified.")
-
-            placeholders = ','.join('?' * len(job_ids))
-
-            # Check current status of specified jobs
-            cursor = db.conn.execute(
-                f"SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_STATUS FROM jobs WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})",
-                job_ids
-            )
-            rows = cursor.fetchall()
-            found = {row[0]: row[1] for row in rows}
-            missing = [jid for jid in job_ids if jid not in found]
-            for jid in missing:
-                print(f"  Warning: job ID not found: {jid}")
-            for jid, status in found.items():
-                if status != 'running':
-                    print(f"  Warning: {jid} is not running (status={status}), skipping")
-
-            # Mark running jobs for kill in DB (backward compat for old workers)
-            db.conn.execute(
-                f"UPDATE jobs SET JOBSCHEDULER_KILL_REQUESTED = datetime('now') "
-                f"WHERE JOBSCHEDULER_JOB_ID IN ({placeholders}) AND JOBSCHEDULER_STATUS = 'running'",
-                job_ids
-            )
-            db.conn.commit()
-            killed_count = db.conn.total_changes
-
-            # Also create .kill sentinel files for file-based heartbeat workers
-            running_ids = [jid for jid, status in found.items() if status == 'running']
-            if running_ids:
-                hb_dir = Path(args.db_file + ".heartbeat")
-                if hb_dir.exists():
-                    for jid in running_ids:
-                        try:
-                            (hb_dir / f"{jid}.kill").touch()
-                        except Exception as e:
-                            print(f"  Warning: failed to create kill sentinel for {jid}: {e}")
-
+            killed_count = db.request_kill(job_ids)
             print(f"✓ Marked {killed_count} running job(s) for termination")
             if killed_count > 0:
                 print("  The scheduler will detect the signal within the next heartbeat interval (default: 30s)")
+
+    # Handle show
+    elif args.command == 'show':
+        if not Path(args.db_path).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_path}")
+        with JobDatabase(args.db_path, read_only=True) as db:
+            job = db.get_job(args.job_id)
+            if job is None:
+                print(f"Error: job not found: {args.job_id}", file=sys.stderr)
+                sys.exit(2)
+            depends_on, dependents = db.get_dependencies(args.job_id)
+        _print_job_detail(job, depends_on, dependents)
+
+    # Handle list
+    elif args.command == 'list':
+        if not Path(args.db_path).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_path}")
+        columns = [c.strip() for c in args.columns.split(',') if c.strip()] if args.columns else None
+        try:
+            with JobDatabase(args.db_path, read_only=True) as db:
+                headers, rows = db.list_jobs(
+                    status=args.status,
+                    worker=args.worker,
+                    grep_error=args.grep_error,
+                    since=args.since,
+                    until=args.until,
+                    priority_min=args.priority_min,
+                    priority_max=args.priority_max,
+                    sort=args.sort,
+                    limit=args.limit,
+                    columns=columns,
+                )
+        except ValueError as e:
+            sys.exit(f"Error: {e}")
+        _print_job_list(headers, rows, display_columns=columns)
 
 
 if __name__ == "__main__":
