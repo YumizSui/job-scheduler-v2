@@ -58,10 +58,15 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 		→ Ready/Waiting/Blocked の状態も表示
 		→ stuckジョブ（heartbeat2分超）を自動リカバリ（`--no-recover`で無効化）
 
-	6. 結果をエクスポート
+	6. ジョブを調べる
+		`db_util show job_00000003 --db-path experiments.db`   (単一ジョブの全カラム)
+		`db_util list --db-path experiments.db --status error --grep-error "CUDA"` (error絞り込み)
+		`db_util stats experiments.db --by worker`   (worker別集計)
+		`job_tui experiments.db`   (インタラクティブTUI、/でフィルタ、Enterで詳細)
+
+	7. 結果をエクスポート（機械処理・他ツール連携用）
 		`db_util export experiments.db` (自動的に experiments.csv にエクスポート)
 		`db_util export experiments.db done.csv --status done` (完了のみ)
-		`db_util export experiments.db error.csv --status error` (失敗のみ)
 
 [*** よくある使い方]
 	大量の実験パラメータを試す
@@ -72,6 +77,9 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 
 	失敗したジョブだけリトライ
 		code:bash
+		 # エラー内容を確認してからリセット
+		 db_util list --db-path experiments.db --status error --grep-error "."
+		 db_util show job_00000000 --db-path experiments.db
 		 # エラージョブのみリセット
 		 db_util reset experiments.db --status error
 		 # 特定ジョブのみリセット

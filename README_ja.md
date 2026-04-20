@@ -6,7 +6,7 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のHPC環境向�
 
 ## 特徴
 
-✅ **安全な並列アクセス**: SQLite（WALモード）でマルチノード環境でも安全
+✅ **安全な並列アクセス**: SQLiteのアトミックトランザクションでマルチノード環境でも安全
 ✅ **ジョブ依存関係**: DAG形式の依存関係管理（ジョブAとBが完了後にジョブCを実行）
 ✅ **優先度スケジューリング**: 重要なジョブを優先実行
 ✅ **賢いスケジューリング**: 残り時間を考慮した実行判断
@@ -15,6 +15,8 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のHPC環境向�
 ✅ **CSV連携**: 簡単なデータ管理（インポート/エクスポート）
 ✅ **中断からの復旧**: 予期せぬ中断後も自動で復旧
 ✅ **進捗可視化**: 専用ビューアでリアルタイム監視（依存状態も表示）
+✅ **DB閲覧CLI**: `show`/`list`/`stats --by` — CSVに吐かずジョブを直接検索・閲覧
+✅ **インタラクティブTUI**: `job_tui` — ↑↓で選択・`/`フィルタ・`Enter`詳細表示
 
 ## クイックスタート
 
@@ -56,18 +58,22 @@ progress_viewer experiments.db --watch
 
 ## インストール
 
-標準ライブラリのみで動作します（Python 3.6+）：
-
 ```bash
 git clone <repository>
 cd job-scheduler-v2
-chmod +x script/job_scheduler script/db_util script/progress_viewer
+chmod +x script/job_scheduler script/db_util script/progress_viewer script/job_tui
 
 # パスを通す
 export PATH="$(pwd)/script:$PATH"
 
 # 永続化する場合は ~/.bashrc に追加
 echo 'export PATH="/path/to/job-scheduler-v2/script:$PATH"' >> ~/.bashrc
+```
+
+`job_scheduler` は Python 標準ライブラリのみで動作します。`db_util show`/`list`/`stats --by` と `job_tui` の実行には `.venv` が必要です：
+
+```bash
+uv sync   # .venv を構築（rich + textual をインストール）
 ```
 
 ## 使い方
@@ -126,6 +132,30 @@ jobD,evaluation,jobC
 
 依存ジョブが`error`の場合、その依存関係を持つジョブは永久にブロックされますが、スケジューラは自動的に停止します。
 
+### データベース閲覧
+
+```bash
+# 単一ジョブの全カラム（引数・ステータス・エラー内容・タイムスタンプ）を表示
+db_util show job_00000003 --db-path jobs.db
+
+# 整形テーブルでジョブ一覧（デフォルトはユーザ列 + 主要カラム）
+db_util list --db-path jobs.db
+
+# フィルタ：errorでCUDAメモリ不足のもの
+db_util list --db-path jobs.db --status error --grep-error "CUDA out of memory"
+
+# 特定ワーカー・優先度範囲・ソート指定
+db_util list --db-path jobs.db --worker "hostname:12345" --priority-min 5 \
+  --sort JOBSCHEDULER_ELAPSED_TIME
+
+# 表示カラムを指定
+db_util list --db-path jobs.db --columns JOBSCHEDULER_JOB_ID,JOBSCHEDULER_STATUS,paramA,paramB
+
+# 統計（worker別・priority別の内訳）
+db_util stats jobs.db --by worker
+db_util stats jobs.db --by priority
+```
+
 ### データベース管理
 
 ```bash
@@ -138,18 +168,12 @@ db_util import input.csv --db-path jobs.db
 # 既存DBにジョブ追加（スキーマ整合性チェック付き）
 db_util add new_jobs.csv --db-path jobs.db
 
-# SQLite → CSV（自動的にファイル名から.csvに変換）
+# SQLite → CSV（機械処理・他ツール連携用）
 db_util export jobs.db
-
-# フィルタ付きエクスポート
 db_util export jobs.db --csv-path done.csv --status done
-db_util export jobs.db --csv-path error.csv --status error
 
 # 統計表示（stuckジョブを自動リカバリ）
 db_util stats jobs.db
-
-# 統計表示（自動リカバリを無効化）
-db_util stats jobs.db --no-recover
 
 # すべてのジョブをpendingにリセット
 db_util reset jobs.db
@@ -163,14 +187,36 @@ db_util reset jobs.db --jobs job_00000000,job_00000001
 # 特定IDかつエラーのみリセット（両条件のAND）
 db_util reset jobs.db --jobs job_00000000,job_00000001 --status error
 
-# ジョブをdone/errorステータスに設定（スキップ済みとして扱うなど）
+# ジョブをdone/errorステータスに設定
 db_util reset jobs.db --set-status done --jobs job_00000005
 db_util reset jobs.db --set-status error --status running
 
-# 実行中のジョブを強制終了（errorステータスに変更）
+# 実行中のジョブを強制終了
 db_util kill jobs.db --jobs job_00000042
 db_util kill jobs.db --jobs job_00000042,job_00000043
 ```
+
+### インタラクティブTUI
+
+```bash
+# DB を TUI でブラウズ（閲覧専用、5秒ごとに自動リロード）
+job_tui jobs.db
+
+# reset / kill 操作を有効化（確認モーダルあり）
+job_tui jobs.db --enable-actions
+
+# 自動リフレッシュを無効化（r キーで手動更新）
+job_tui jobs.db --no-auto-refresh
+
+# リフレッシュ間隔を調整（デフォルト5秒、40並列ワーカー規模でも安全）
+job_tui jobs.db --refresh-interval 10
+```
+
+**キー操作**:
+- `↑↓` でスクロール、`Enter` で詳細パネル表示
+- `/` でフィルタ入力（`status=error` `worker=host1` や自由テキストでERROR_MESSAGEを検索）
+- `s` でソート列切替、`p` で一時停止、`r` で手動リフレッシュ
+- `--enable-actions` 時: `Ctrl+R` でreset→pending、`Ctrl+K` でkill（確認あり）
 
 ### 進捗監視
 
@@ -269,7 +315,6 @@ job_scheduler <db_file> <command> [options]
 
 ### マルチノード安全性
 
-- **WALモード**: 複数リーダー + 1ライター同時アクセス
 - **BEGIN IMMEDIATE**: 早期にロックを取得して競合を検出
 - **busy_timeout=30秒**: ロック競合時は自動リトライ（最大3回）
 - **アトミック更新**: すべてのステータス変更はトランザクション内で実行
@@ -307,8 +352,9 @@ job_scheduler jobs.db "bash run.sh" --smart-scheduling false
 ### Q: 依存ジョブがエラーでブロックされている
 
 ```bash
-# ブロックされたジョブを確認
-progress_viewer jobs.db
+# エラー内容を確認
+db_util list --db-path jobs.db --status error --grep-error "."
+db_util show job_00000003 --db-path jobs.db
 
 # エラージョブのみリセットして再実行
 db_util reset jobs.db --status error

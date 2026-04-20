@@ -9,7 +9,7 @@ SQLite-based parallel job scheduler for HPC environments (TSUBAME, etc.)
 
 ## Features
 
-- ✅ **Safe Concurrent Access**: SQLite with WAL mode for multi-node safety
+- ✅ **Safe Concurrent Access**: SQLite with atomic transactions for multi-node safety
 - ✅ **Job Dependencies**: DAG-based dependency management (job dependencies)
 - ✅ **Priority Scheduling**: Execute important jobs first
 - ✅ **Smart Scheduling**: Consider remaining time for job selection
@@ -17,6 +17,8 @@ SQLite-based parallel job scheduler for HPC environments (TSUBAME, etc.)
 - ✅ **Real-time Output**: Stream stdout/stderr in real-time
 - ✅ **Automatic Recovery**: Auto-recover from unexpected interruptions
 - ✅ **Progress Viewer**: Real-time monitoring with dependency status
+- ✅ **DB Inspection CLI**: `show`/`list`/`stats --by` — inspect jobs without CSV export
+- ✅ **Interactive TUI**: `job_tui` — browse, filter, and manage jobs interactively
 
 ## Quick Start
 
@@ -29,6 +31,11 @@ job_scheduler jobs.db "bash run.sh"
 
 # 3. Monitor progress
 progress_viewer jobs.db --watch
+
+# 4. Inspect results
+db_util list --db-path jobs.db --status error --grep-error "CUDA"
+db_util show job_00000003 --db-path jobs.db
+job_tui jobs.db
 ```
 
 ## Installation
@@ -45,7 +52,11 @@ export PATH="$(pwd)/script:$PATH"
 echo 'export PATH="/path/to/job-runner-v2/script:$PATH"' >> ~/.bashrc
 ```
 
-No external dependencies required! (Python 3.6+ standard library only)
+`job_scheduler` requires only Python stdlib. For `db_util show`/`list`, `stats --by`, and `job_tui`, install optional dependencies first:
+
+```bash
+uv sync        # creates .venv with rich + textual
+```
 
 ## Documentation
 
