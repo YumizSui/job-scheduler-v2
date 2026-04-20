@@ -424,7 +424,7 @@ def main():
     )
     parser.add_argument('db_path', help='SQLite database file path')
     parser.add_argument('--enable-actions', action='store_true',
-                        help='Enable Ctrl+R (reset→pending) and Ctrl+K (kill) actions')
+                        help='Enable Shift+R (reset→pending) and Shift+K (kill) actions')
     parser.add_argument('--auto-refresh', action='store_true',
                         help='Enable auto-refresh (default: off; use r to refresh manually)')
     parser.add_argument('--refresh-interval', type=float, default=5.0,
