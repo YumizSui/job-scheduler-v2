@@ -155,6 +155,8 @@ class JobTUI(App):
         Binding("p", "toggle_pause", "Pause"),
         Binding("r", "refresh_now", "Refresh"),
         Binding("q", "quit", "Quit"),
+        Binding("R", "reset_job", "Reset→pending", priority=True),
+        Binding("K", "kill_job", "Kill", priority=True),
     ]
 
     def __init__(self, db_path: str, enable_actions: bool = False,
@@ -172,12 +174,6 @@ class JobTUI(App):
         self._headers: list[str] = []
         self._all_rows: list = []
         self._table_col_indices: list[int] = []
-
-        if enable_actions:
-            self.BINDINGS = list(self.BINDINGS) + [
-                Binding("R", "reset_job", "Reset→pending", priority=True),
-                Binding("K", "kill_job", "Kill", priority=True),
-            ]
 
     def compose(self) -> ComposeResult:
         yield Header()

@@ -214,7 +214,7 @@ job_tui jobs.db --refresh-interval 10
 
 **キー操作**:
 - `↑↓` でスクロール、`Enter` で詳細パネル表示
-- `/` でフィルタ入力（`status=error` `worker=host1` や自由テキストで全カラム部分一致検索、入力は300msデバウンス）
+- `/` でフィルタ入力（`status=error` `worker=host1` や自由テキストで全カラム部分一致検索）
 - `s` でソート列切替、`p` で一時停止、`r` で手動リフレッシュ
 - `--enable-actions` 時: `Shift+R` でreset→pending、`Shift+K` でkill（確認あり）
 
