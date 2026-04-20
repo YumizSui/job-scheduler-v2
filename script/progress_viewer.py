@@ -248,10 +248,27 @@ class ProgressViewer:
 
         return len(stuck_job_ids)
 
+    def _step(self, msg: str) -> None:
+        print(f"\r[{datetime.now().strftime('%H:%M:%S')}] {msg}...", end="", flush=True, file=sys.stderr)
+
+    def _step_clear(self) -> None:
+        print("\r" + " " * 72 + "\r", end="", flush=True, file=sys.stderr)
+
     def print_progress(self, clear_screen: bool = False):
         """Print current progress"""
         if self.auto_recover:
+            self._step("Checking stuck jobs")
             self.recover_stuck_jobs()
+
+        self._step("Fetching stats")
+        stats = self.get_stats()
+        self._step("Fetching running jobs")
+        running_jobs = self.get_running_jobs()
+        self._step("Fetching recent completed")
+        recent = self.get_recent_completed(5)
+        self._step("Estimating remaining time")
+        est_time = self.get_estimated_time_remaining()
+        self._step_clear()
 
         if clear_screen:
             # Clear screen (ANSI escape code)
@@ -264,7 +281,6 @@ class ProgressViewer:
         print("="*70)
 
         # Statistics
-        stats = self.get_stats()
         total = stats.get('total', 0)
         pending = stats.get('pending', 0)
         running = stats.get('running', 0)
@@ -296,14 +312,12 @@ class ProgressViewer:
         print(f"  Progress:      [{self._progress_bar(completion_rate, 40)}] {completion_rate:.1f}%")
 
         # Estimated time remaining
-        est_time = self.get_estimated_time_remaining()
         if est_time is not None:
             minutes = int(est_time / 60)
             seconds = int(est_time % 60)
             print(f"  Est. remaining: ~{minutes}m {seconds}s")
 
         # Running jobs
-        running_jobs = self.get_running_jobs()
         if running_jobs:
             print(f"\nCurrently Running ({len(running_jobs)} jobs):")
             for job in running_jobs[:10]:  # Show max 10
@@ -335,7 +349,6 @@ class ProgressViewer:
                 print(f"  ... and {len(running_jobs) - 10} more")
 
         # Recent completed
-        recent = self.get_recent_completed(5)
         if recent:
             print(f"\nRecently Completed:")
             for job in recent:

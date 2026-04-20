@@ -167,6 +167,7 @@ class JobTUI(App):
         self._initial_theme: str | None = _load_config().get("theme")
         self._paused = False
         self._filter_text = ""
+        self._debounce_timer = None
         self._sort_idx = 0
         self._headers: list[str] = []
         self._all_rows: list = []
@@ -279,12 +280,14 @@ class JobTUI(App):
                     op, val = key_val['priority']
                     if priority_col is None or not _cmp(row[priority_col], op, val):
                         return False
-                if remainder and error_col is not None:
+                if remainder:
+                    all_text = " ".join(str(v or '') for v in row)
                     try:
-                        if not re.search(remainder, str(row[error_col] or ''), re.IGNORECASE):
+                        if not re.search(remainder, all_text, re.IGNORECASE):
                             return False
                     except re.error:
-                        pass
+                        if remainder not in all_text.lower():
+                            return False
                 return True
 
             filtered = [r for r in self._all_rows if row_matches(r)]
@@ -348,7 +351,9 @@ class JobTUI(App):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self._filter_text = event.value
-        self._apply_filter()
+        if self._debounce_timer is not None:
+            self._debounce_timer.stop()
+        self._debounce_timer = self.set_timer(0.3, self._apply_filter)
 
     def action_cycle_sort(self) -> None:
         self._sort_idx = (self._sort_idx + 1) % len(_SORT_CYCLE)

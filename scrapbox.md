@@ -1,6 +1,6 @@
 Job Scheduler v2
 #tsubame4
-2026/3/25更新
+2026/4/20更新
 
 [kfurui.icon] [JobScheduler]のsqlite3使った安全版（開発中）
 GitHubリポジトリ https://github.com/YumizSui/job-scheduler-v2
@@ -62,7 +62,9 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 		`db_util show job_00000003 --db-path experiments.db`   (単一ジョブの全カラム)
 		`db_util list --db-path experiments.db --status error --grep-error "CUDA"` (error絞り込み)
 		`db_util stats experiments.db --by worker`   (worker別集計)
-		`job_tui experiments.db`   (インタラクティブTUI、/でフィルタ、Enterで詳細)
+		`job_tui experiments.db`   (インタラクティブTUI、/でフィルタ、Enterで詳細、rで手動更新)
+			`job_tui experiments.db --auto-refresh`   (自動更新モード)
+			フィルタは比較演算子対応：`status=running`、`priority>3`、`status!=done`、フリーテキスト混在可
 
 	7. 結果をエクスポート（機械処理・他ツール連携用）
 		`db_util export experiments.db` (自動的に experiments.csv にエクスポート)
