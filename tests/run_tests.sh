@@ -14,7 +14,7 @@ echo "Hostname: $(hostname)"
 echo "Start time: $(date)"
 echo "=========================================="
 
-uv run --with pytest python -m pytest tests/test_longest_first.py tests/test_log_output.py tests/test_concurrent_claim.py -v -s
+uv run --with pytest python -m pytest tests/test_longest_first.py tests/test_log_output.py tests/test_concurrent_claim.py tests/test_db_util_cli.py -v -s
 EXIT_CODE=$?
 
 echo ""
