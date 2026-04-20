@@ -154,7 +154,6 @@ class JobTUI(App):
         Binding("s", "cycle_sort", "Sort"),
         Binding("p", "toggle_pause", "Pause"),
         Binding("r", "refresh_now", "Refresh"),
-        Binding("y", "yank_job", "Yank"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -332,26 +331,6 @@ class JobTUI(App):
                     self.query_one("#detail-panel", DetailPanel).show_job(job, dep_on, dep_by)
         except Exception:
             pass
-
-    def action_yank_job(self) -> None:
-        job_id = self._selected_job_id()
-        if not job_id:
-            return
-        try:
-            with JobDatabase(self.db_path, read_only=True) as db:
-                job = db.get_job(job_id)
-                if not job:
-                    return
-                dep_on, dep_by = db.get_dependencies(job_id)
-            lines = [f"{_short(k)}: {v}" for k, v in job.items() if v is not None]
-            if dep_on:
-                lines.append(f"Depends on: {', '.join(dep_on)}")
-            if dep_by:
-                lines.append(f"Dependents: {', '.join(dep_by)}")
-            self.copy_to_clipboard("\n".join(lines))
-            self.query_one("#status-bar", Label).update(f"Copied {job_id} to clipboard")
-        except Exception as e:
-            self.query_one("#status-bar", Label).update(f"[red]yank failed: {e}[/red]")
 
     def action_focus_filter(self) -> None:
         self.query_one("#filter-bar", Input).focus()
