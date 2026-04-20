@@ -1,0 +1,13 @@
+#!/bin/bash
+# Job TUI - Interactive job browser
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+VENV_PY="$ROOT_DIR/.venv/bin/python"
+if [ ! -x "$VENV_PY" ]; then
+    echo "Error: .venv not found. Run 'uv sync' in the project root first." >&2
+    exit 1
+fi
+
+exec "$VENV_PY" "$SCRIPT_DIR/job_tui.py" "$@"
