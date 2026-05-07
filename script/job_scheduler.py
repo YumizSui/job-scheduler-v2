@@ -430,6 +430,33 @@ class JobScheduler:
         except Exception:
             pass
 
+    def _terminate_process_group(self, process, job_id: str, timeout: float = 5.0) -> None:
+        """Send SIGTERM to the process group, escalate to SIGKILL after `timeout` seconds.
+
+        Requires the process to have been started with start_new_session=True so that
+        shell wrappers (e.g. bash → python) share a dedicated PGID and are all terminated.
+        """
+        try:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            return  # already dead
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logging.warning(f"Job {job_id} did not terminate gracefully. SIGKILL to pgid {pgid}.")
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logging.error(f"Job {job_id} pgid {pgid} did not respond to SIGKILL.")
+
     def run_job(self, job: Dict, max_time: float, worker_id: int = 0) -> Tuple[int, float, Optional[str]]:
         """
         Execute a single job
@@ -470,6 +497,7 @@ class JobScheduler:
                 text=True,
                 bufsize=1,
                 env=env,
+                start_new_session=True,
             )
 
             # Monitor output
@@ -500,12 +528,7 @@ class JobScheduler:
             while process.poll() is None and not shutdown_event.is_set() and not kill_event.is_set():
                 if time.time() >= end_time:
                     logging.warning(f"Job {job_id} exceeded maximum runtime. Terminating.")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        logging.warning(f"Job {job_id} did not terminate gracefully. Killing.")
-                        process.kill()
+                    self._terminate_process_group(process, job_id)
                     return_code = -2
                     error_message = "Timeout: exceeded maximum runtime"
                     break
@@ -514,19 +537,11 @@ class JobScheduler:
             if return_code is None:
                 if kill_event.is_set():
                     logging.warning(f"Job {job_id} force kill requested. Terminating.")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    self._terminate_process_group(process, job_id)
                     return_code = -3
                     error_message = "Force killed by user request"
                 elif shutdown_event.is_set():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    self._terminate_process_group(process, job_id)
                     return_code = -2
                     error_message = "Interrupted by shutdown signal"
                 else:
