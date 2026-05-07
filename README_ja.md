@@ -172,10 +172,15 @@ db_util add new_jobs.csv --db-path jobs.db
 db_util export jobs.db
 db_util export jobs.db --csv-path done.csv --status done
 
-# 統計表示（stuckジョブを自動リカバリ）
+# 統計表示（heartbeatとstatusの齟齬を双方向に自動リカバリ）
 db_util stats jobs.db
 
-# すべてのジョブをpendingにリセット
+# heartbeatとstatusの齟齬を手動で解消
+db_util recover jobs.db                         # 両方向（デフォルト）
+db_util recover jobs.db --direction stuck       # running→pending のみ
+db_util recover jobs.db --direction mismatch    # pending/error→running のみ
+
+# すべてのジョブをpendingにリセット（実行中ジョブはheartbeatで保護）
 db_util reset jobs.db
 
 # エラージョブのみpendingにリセット
@@ -216,12 +221,13 @@ job_tui jobs.db --refresh-interval 10
 - `↑↓` でスクロール、`Enter` で詳細パネル表示
 - `/` でフィルタ入力（`status=error` `worker=host1` や自由テキストで全カラム部分一致検索）
 - `s` でソート列切替、`p` で一時停止、`r` で手動リフレッシュ
+- `q` / `Esc` で終了（確認ダイアログあり）
 - `--enable-actions` 時: `Ctrl+R` でreset→pending、`Ctrl+K` でkill（確認あり）
 
 ### 進捗監視
 
 ```bash
-# 1回だけ表示（stuckジョブを自動リカバリ）
+# 1回だけ表示（heartbeatとstatusの齟齬を双方向に自動リカバリ）
 progress_viewer jobs.db
 
 # リアルタイム監視（2秒ごとに更新）
@@ -230,10 +236,10 @@ progress_viewer jobs.db --watch
 # 更新間隔を変更
 progress_viewer jobs.db --watch --interval 5
 
-# 自動リカバリを無効化
+# 自動リカバリを無効化（両方向とも止まる）
 progress_viewer jobs.db --no-recover
 
-# stuckと判定する閾値を変更（デフォルト120秒）
+# stale/fresh判定の閾値を変更（デフォルト120秒）
 progress_viewer jobs.db --stale-threshold 300
 ```
 
@@ -315,27 +321,38 @@ job_scheduler <db_file> <command> [options]
 
 ### マルチノード安全性
 
-- **BEGIN IMMEDIATE**: 早期にロックを取得して競合を検出
-- **busy_timeout=30秒**: ロック競合時は自動リトライ（最大3回）
+- **BEGIN IMMEDIATE による直列化**: ジョブ取得は SELECT+UPDATE を 1 トランザクションにまとめ、SQLite の書込みロックでワーカー間を直列化。重複取得や race の心配なく 48 並列クラスでも安定動作
+- **busy_timeout=30秒**: 他ワーカーがロック中はブロック待機。タイムアウト時は指数バックオフで最大5回リトライ
 - **アトミック更新**: すべてのステータス変更はトランザクション内で実行
 - **ハートビート方式**: 実行中ジョブは30秒ごとに生存を通知
-- **Stuck Job Recovery**: `job_scheduler` 起動時・`progress_viewer` 実行時・`db_util stats` 実行時に、ハートビートが2分以上途絶えたジョブのみを`pending`に自動復旧（アクティブなワーカーのジョブは保護）
+- **双方向 Auto Recovery**: heartbeat と DB status の齟齬を `progress_viewer`・`db_util stats`・`db_util reset`・`db_util recover` 実行時に自動解消
+  - `running` のまま heartbeat が2分以上途絶えたジョブ → `pending` に戻してリスケ対象に
+  - heartbeat が生きている（worker が touch し続けている）のに status が `running` 以外に外れたジョブ → `running` に復帰（reset の誤爆等を保護）
 
 ## トラブルシューティング
 
 ### Q: ジョブが`running`状態で止まっている
 
 ```bash
-# progress_viewer や db_util stats を実行すると自動的にリカバリされます
-# （ハートビートが2分以上途絶えたジョブのみ。アクティブなワーカーのジョブは保護）
+# progress_viewer / db_util stats / db_util recover のいずれかで双方向自動リカバリ
+# （heartbeatが2分以上途絶えたジョブのみpendingに戻す。生きているジョブは保護）
 progress_viewer jobs.db
 db_util stats jobs.db
+db_util recover jobs.db
 
-# job_scheduler 起動時にもリカバリされます
+# job_scheduler 起動時にも stuck recovery が走ります
 job_scheduler jobs.db "bash run.sh"
 
 # 手動で全ジョブをpendingにリセットする場合
 db_util reset jobs.db
+```
+
+### Q: `reset` で誤ってrunning中のジョブをerror/pendingにしてしまった
+
+```bash
+# heartbeatが生きている（worker が touch し続けている）ジョブは
+# reset 直後や db_util recover で自動的に running に復帰します。
+db_util recover jobs.db --direction mismatch
 ```
 
 ### Q: ジョブが実行されない
@@ -369,7 +386,7 @@ job_scheduler jobs.db "bash run.sh"
 # 実行中のジョブIDを確認
 progress_viewer jobs.db
 
-# 強制終了（schedulerが次のheartbeat時に検知してerrorにする、最大30秒）
+# 強制終了（schedulerがheartbeat時に検知し、プロセスグループ全体をSIGTERM→5秒後SIGKILL、最大30秒でerrorになる）
 db_util kill jobs.db --jobs job_00000042
 
 # 複数ジョブをまとめて強制終了
@@ -383,9 +400,9 @@ db_util kill jobs.db --jobs job_00000042,job_00000043
 
 ### Q: 並列実行しても速くならない
 
-- `--parallel`は1ノード内の並列数です。複数ノード投入の方が効率的
+- `--parallel`は1ノード内の並列数です。CPU/GPU リソースに応じて指定（48 並列まで動作確認済み）
 - ジョブが軽すぎる（<1秒）場合はオーバーヘッドの影響が大きい
-- 推奨：1ノード内は2-4並列程度、それ以上は複数ノード投入を推奨
+- ノード資源を超える並列は意味なし。複数ノードに分散したい場合は qsub アレイジョブで複数 worker を投入
 
 ## ライセンス
 

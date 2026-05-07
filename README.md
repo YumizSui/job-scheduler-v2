@@ -15,7 +15,7 @@ SQLite-based parallel job scheduler for HPC environments (TSUBAME, etc.)
 - ✅ **Smart Scheduling**: Consider remaining time for job selection
 - ✅ **Flexible Arguments**: Support both positional and named arguments
 - ✅ **Real-time Output**: Stream stdout/stderr in real-time
-- ✅ **Automatic Recovery**: Auto-recover from unexpected interruptions
+- ✅ **Automatic Recovery**: Bidirectional reconciliation between DB status and heartbeat files (stuck jobs → pending, live jobs wrongly reset → running)
 - ✅ **Progress Viewer**: Real-time monitoring with dependency status
 - ✅ **DB Inspection CLI**: `show`/`list`/`stats --by` — inspect jobs without CSV export
 - ✅ **Interactive TUI**: `job_tui` — browse, filter, and manage jobs interactively

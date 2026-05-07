@@ -13,10 +13,10 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	優先度付きスケジューリング
 	マルチノード並列実行（qsubアレイジョブ対応）
 	進捗のリアルタイム監視（依存状態も表示）
-	中断しても自動復旧（progress_viewer・db_util stats実行時にも復旧。実行中のジョブは保護）
+	中断・誤操作から自動復旧（heartbeatとDB statusの齟齬を双方向でreconcile、実行中のジョブは保護）
 	失敗したジョブだけ再実行
 	実行中に追加ワーカーを投入可能
-	実行中のジョブをIDで強制終了（errorステータスへ）
+	実行中のジョブをIDで強制終了（プロセスグループごとSIGTERM→SIGKILL、errorステータスへ）
 
 [*** 基本的な使い方]
 	1. セットアップ
@@ -56,13 +56,15 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	5. 進捗確認
 		`progress_viewer experiments.db --watch`
 		→ Ready/Waiting/Blocked の状態も表示
-		→ stuckジョブ（heartbeat2分超）を自動リカバリ（`--no-recover`で無効化）
+		→ heartbeatとDB statusの齟齬を双方向で自動リカバリ（`--no-recover`で無効化）
+			heartbeat途絶（2分超）のrunning → pending
+			heartbeat生存中なのにstatusが外れた → running
 
 	6. ジョブを調べる
 		`db_util show job_00000003 --db-path experiments.db`   (単一ジョブの全カラム)
 		`db_util list --db-path experiments.db --status error --grep-error "CUDA"` (error絞り込み)
 		`db_util stats experiments.db --by worker`   (worker別集計)
-		`job_tui experiments.db`   (インタラクティブTUI、/でフィルタ、Enterで詳細、rで手動更新)
+		`job_tui experiments.db`   (インタラクティブTUI、/でフィルタ、Enterで詳細、rで手動更新、q/Escで終了確認)
 			`job_tui experiments.db --auto-refresh`   (自動更新モード)
 			フィルタは比較演算子対応：`status=running`、`priority>3`、`status!=done`、フリーテキスト混在可
 
@@ -82,7 +84,7 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 		 # エラー内容を確認してからリセット
 		 db_util list --db-path experiments.db --status error --grep-error "."
 		 db_util show job_00000000 --db-path experiments.db
-		 # エラージョブのみリセット
+		 # エラージョブのみリセット（実行中のジョブはheartbeatで保護されるので誤爆しない）
 		 db_util reset experiments.db --status error
 		 # 特定ジョブのみリセット
 		 db_util reset experiments.db --jobs job_00000000,job_00000001
@@ -106,7 +108,16 @@ SQLiteベースの並列ジョブスケジューラ（TSUBAME等のqsub向け）
 	実行中のジョブを強制終了
 		code:bash
 		 db_util kill experiments.db --jobs job_00000042
-		# schedulerが次のheartbeat（デフォルト30秒）で検知してerrorにする
+		# schedulerがheartbeat時に検知し、プロセスグループ全体をSIGTERM→5秒後SIGKILLで確実に停止（bash経由の孫プロセスも含む）
+		# 最大30秒後にerrorになる
+
+	statusが巻き戻ってしまった場合の手動復旧
+		code:bash
+		 # heartbeatとDB statusの齟齬を双方向で解消
+		 db_util recover experiments.db
+		 # 片方向だけ走らせたいとき
+		 db_util recover experiments.db --direction stuck      # running→pending のみ
+		 db_util recover experiments.db --direction mismatch   # pending/error→running のみ
 
 
 	時間制約のあるジョブ（24時間以内、最後5分はマージン）

@@ -165,7 +165,7 @@ job_scheduler retry.db "bash run.sh"
 または：
 
 ```bash
-# エラージョブのみpendingに戻す
+# エラージョブのみpendingに戻す（heartbeatが生きているジョブは自動で保護）
 db_util reset jobs.db --status error
 job_scheduler jobs.db "bash run.sh"
 ```
@@ -203,16 +203,27 @@ progress_viewer jobs.db
 ### Q: 途中でジョブが止まった
 
 ```bash
-# progress_viewer や db_util stats を実行すると自動的にリカバリされます
-# （ハートビートが2分以上途絶えたジョブのみ。アクティブなワーカーのジョブは保護）
+# progress_viewer / db_util stats / db_util recover のいずれかで双方向自動リカバリ
+# heartbeatが2分以上途絶えた running → pending に戻し、
+# heartbeatが生きているのに status がずれたジョブ → running に復帰
 progress_viewer jobs.db
 db_util stats jobs.db
+db_util recover jobs.db
 
-# job_scheduler 起動時にもリカバリされます
+# job_scheduler 起動時にも stuck recovery が走ります
 job_scheduler jobs.db "bash run.sh"
 
 # 手動で全runningジョブをpendingに戻す場合
 db_util reset jobs.db
+```
+
+### Q: `reset` でrunning中のジョブまで巻き戻してしまった
+
+```bash
+# heartbeatが生きているジョブは自動で running に復帰します。
+# reset コマンドは実行直後にも自動 reconcile しますが、
+# 手動で走らせたい場合は以下:
+db_util recover jobs.db --direction mismatch
 ```
 
 ### Q: 依存ジョブがエラーでブロックされている
@@ -233,15 +244,16 @@ job_scheduler jobs.db "bash run.sh"
 # 実行中ジョブのIDを確認
 progress_viewer jobs.db
 
-# 強制終了（schedulerが次のheartbeat時に検知、最大30秒後にerrorになる）
+# 強制終了（schedulerがheartbeat時に検知し、プロセスグループ全体をSIGTERM→5秒後SIGKILL、最大30秒でerrorになる）
 db_util kill jobs.db --jobs job_00000042
 ```
 
 ### Q: 並列実行してもあまり速くならない
 
-- SQLiteのロック競合が発生している可能性
-- `--parallel` は1ノード内の並列数なので、複数ノード投入の方が効率的
-- または、ジョブが軽すぎてオーバーヘッドが大きい
+- `--parallel` は1ノード内の並列数。CPU/GPU リソースに応じて指定（48 並列まで動作確認済み）
+- ジョブ取得は BEGIN IMMEDIATE で直列化されるが claim 自体は数 ms オーダーなので並列度のボトルネックにはならない
+- ジョブが軽すぎる（<1秒）とオーバーヘッドが目立つ
+- ノード資源を超えたい場合は qsub アレイジョブで複数 worker を投入
 
 ### Q: 進捗ビューアが動かない
 
