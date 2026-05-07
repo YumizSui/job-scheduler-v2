@@ -124,15 +124,16 @@ class JobScheduler:
         """
         Get next pending job based on priority and estimate_time.
 
+        SELECT and UPDATE run inside a single BEGIN IMMEDIATE transaction so
+        concurrent workers serialize on the SQLite write lock. This eliminates
+        races at the cost of sequential claiming, which is acceptable because
+        the SELECT is index-backed and finishes in milliseconds.
+
         If target_job_ids is given, only consider jobs with those IDs.
         Returns job dict or None if no suitable job available.
         """
         max_retries = 5
 
-        # Pre-attempt jitter: spread out simultaneous requests from many workers
-        time.sleep(random.uniform(0, 0.5))
-
-        # Build query (reused across attempts)
         order_by = "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_ESTIMATE_TIME DESC, JOBSCHEDULER_JOB_ID" if self.longest_first else "JOBSCHEDULER_PRIORITY DESC, JOBSCHEDULER_JOB_ID"
         job_id_filter = ""
         job_id_params: list = []
@@ -173,77 +174,44 @@ class JobScheduler:
             """
             select_params = job_id_params
 
-        # Two independent counters:
-        #   lock_errors: DB-level SQLITE_BUSY/lock errors (expensive, use exponential backoff)
-        #   conflicts:   optimistic conflicts where another worker claimed the job first (cheap)
-        # Only lock_errors consume max_retries; conflicts are retried cheaply up to max_conflicts.
         lock_errors = 0
-        conflicts = 0
-        max_conflicts = 20  # safety cap; 48 workers can't realistically all win before us
-
-        while True:
-            if lock_errors >= max_retries:
-                logging.warning(f"Database lock conflict after {max_retries} attempts. Giving up.")
-                return None
-            if conflicts >= max_conflicts:
-                logging.warning(f"Lost optimistic race {max_conflicts} times in a row. Giving up.")
-                return None
-
-            # Phase 1: Find candidate without holding any lock.
-            # The complex JOIN query runs here, outside the critical section.
-            conn = self.connect_db()
-            try:
-                row = conn.execute(select_query, select_params).fetchone()
-            except sqlite3.OperationalError as e:
-                logging.warning(f"Failed to query pending jobs: {e}")
-                return None
-            finally:
-                conn.close()
-
-            if row is None:
-                # No pending jobs exist (not a race loss — genuinely empty).
-                return None
-
-            job = dict(row)
-            job_id = job['JOBSCHEDULER_JOB_ID']
-
-            # Phase 2: Claim the job with minimal lock window.
-            # Only a single-row PK check + update runs inside BEGIN IMMEDIATE.
+        while lock_errors < max_retries:
             conn = self.connect_db()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                still_pending = conn.execute(
-                    "SELECT 1 FROM jobs WHERE JOBSCHEDULER_JOB_ID = ? AND JOBSCHEDULER_STATUS = 'pending'",
-                    (job_id,)
-                ).fetchone()
+                row = conn.execute(select_query, select_params).fetchone()
 
-                if still_pending:
-                    conn.execute("""
-                        UPDATE jobs
-                        SET JOBSCHEDULER_STATUS = 'running',
-                            JOBSCHEDULER_STARTED_AT = datetime('now'),
-                            JOBSCHEDULER_HEARTBEAT = datetime('now'),
-                            JOBSCHEDULER_WORKER_ID = ?
-                        WHERE JOBSCHEDULER_JOB_ID = ?
-                    """, (self.worker_id, job_id))
-                    conn.commit()
-                    return job
-                else:
-                    # Another worker claimed this job between our SELECT and lock.
+                if row is None:
                     conn.rollback()
-                    conflicts += 1
-                    # Small jitter before retrying with a fresh candidate.
-                    time.sleep(random.uniform(0, 0.3))
+                    return None
+
+                job = dict(row)
+                job_id = job['JOBSCHEDULER_JOB_ID']
+                conn.execute("""
+                    UPDATE jobs
+                    SET JOBSCHEDULER_STATUS = 'running',
+                        JOBSCHEDULER_STARTED_AT = datetime('now'),
+                        JOBSCHEDULER_HEARTBEAT = datetime('now'),
+                        JOBSCHEDULER_WORKER_ID = ?
+                    WHERE JOBSCHEDULER_JOB_ID = ?
+                """, (self.worker_id, job_id))
+                conn.commit()
+                return job
 
             except sqlite3.OperationalError as e:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
                 lock_errors += 1
                 backoff = random.uniform(0.5, 1.5) * (2 ** lock_errors)
-                logging.warning(f"Database lock conflict (lock_error {lock_errors}/{max_retries}): {e}, retry in {backoff:.1f}s")
+                logging.warning(f"Database lock conflict ({lock_errors}/{max_retries}): {e}, retry in {backoff:.1f}s")
                 time.sleep(backoff)
-
             finally:
                 conn.close()
+
+        logging.warning(f"Database lock conflict after {max_retries} attempts. Giving up.")
+        return None
 
     def has_blocked_pending_jobs(self) -> bool:
         """
@@ -267,6 +235,29 @@ class JobScheduler:
             count = cursor.fetchone()[0]
             return count > 0
 
+        finally:
+            conn.close()
+
+    def count_unrunnable_pending_jobs(self) -> int:
+        """
+        Count pending jobs that have at least one dependency in 'error' state
+        or pointing to a non-existent job. These can never become eligible
+        without manual intervention.
+        """
+        conn = self.connect_db()
+
+        try:
+            cursor = conn.execute("""
+                SELECT COUNT(*) FROM jobs j
+                WHERE j.JOBSCHEDULER_STATUS = 'pending'
+                AND EXISTS (
+                    SELECT 1 FROM job_dependencies d
+                    LEFT JOIN jobs dep ON d.depends_on = dep.JOBSCHEDULER_JOB_ID
+                    WHERE d.job_id = j.JOBSCHEDULER_JOB_ID
+                    AND (dep.JOBSCHEDULER_STATUS IS NULL OR dep.JOBSCHEDULER_STATUS = 'error')
+                )
+            """)
+            return cursor.fetchone()[0]
         finally:
             conn.close()
 
@@ -665,8 +656,8 @@ class JobScheduler:
                     continue
                 else:
                     # Sanity check: confirm there are truly no pending jobs before stopping.
-                    # get_pending_job can return None due to repeated optimistic conflicts or
-                    # lock errors, not only because the queue is empty.
+                    # get_pending_job can return None due to repeated lock contention,
+                    # not only because the queue is empty.
                     conn = self.connect_db()
                     try:
                         remaining = conn.execute(
@@ -675,6 +666,11 @@ class JobScheduler:
                     finally:
                         conn.close()
                     if remaining > 0:
+                        unrunnable = self.count_unrunnable_pending_jobs()
+                        if unrunnable >= remaining:
+                            if worker_id == 0 or self.parallel == 1:
+                                logging.warning(f"Worker {worker_id}: {unrunnable} pending jobs are blocked by error/missing dependencies and cannot run. Stopping.")
+                            break
                         logging.warning(f"Worker {worker_id}: get_pending_job returned None but {remaining} pending jobs exist. Retrying...")
                         time.sleep(random.uniform(1, 3))
                         continue
