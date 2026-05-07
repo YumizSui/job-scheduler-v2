@@ -5,14 +5,15 @@
 ### 1. CSVファイルを用意
 
 ```csv
-param1,param2,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_ESTIMATE_TIME,JOBSCHEDULER_DEPENDS_ON
-alpha,100,5,0.5,
-beta,200,3,0.3,
-gamma,300,8,0.1,alpha beta
+param1,param2,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_DEPENDS_ON
+alpha,100,5,
+beta,200,3,
+gamma,300,8,alpha beta
 ```
 
 - `JOBSCHEDULER_DEPENDS_ON`: 依存ジョブID（スペース区切り）
   - gammaはalphaとbetaが完了してから実行されます
+- `JOBSCHEDULER_ESTIMATE_TIME`（任意列）: 推定実行時間（時間単位）。**デフォルトでは無視される**。`--smart-scheduling true` または `--longest-first` を付けたときだけ参照される（後述のパターン3を参照）
 
 ### 2. SQLiteにインポート
 
@@ -65,6 +66,8 @@ job_scheduler input.db "bash run.sh" --parallel 4
 #$ -l h_rt=24:00:00
 
 source $HOME/.bashrc
+# 途中再開可能なジョブなら --max-runtime は付けない方が安全（中断されても次の worker が拾う）
+# h_rt 内で確実に終わらせたい再開不可ジョブの場合のみ --max-runtime を指定する
 job_scheduler /path/to/input.db "bash run.sh" \
     --max-runtime 86000 \
     --margin-time 300
@@ -131,22 +134,36 @@ watch -n 5 'progress_viewer experiments.db'
 ### パターン2: 優先度付き+依存関係のあるジョブ
 
 ```csv
-JOBSCHEDULER_JOB_ID,task,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_ESTIMATE_TIME,JOBSCHEDULER_DEPENDS_ON
-preprocess,data_prep,10,1.0,
-model_train,train_model,5,5.0,preprocess
-model_eval,evaluate,3,0.5,model_train
-report,generate_report,1,0.3,model_eval
+JOBSCHEDULER_JOB_ID,task,JOBSCHEDULER_PRIORITY,JOBSCHEDULER_DEPENDS_ON
+preprocess,data_prep,10,
+model_train,train_model,5,preprocess
+model_eval,evaluate,3,model_train
+report,generate_report,1,model_eval
 ```
 
 → preprocess → model_train → model_eval → report の順に実行される
 
 ### パターン3: 時間制約のあるジョブ
 
+`--max-runtime` も `--smart-scheduling` も **デフォルトでは効かない**。次のいずれかに当てはまる場合だけ明示的に有効化する:
+
+- 途中で打ち切られると最初からやり直しになるジョブ（FEPの一部、長時間 MD など）で h_rt 内に収めたい
+- ジョブの実行時間が大きくばらつき、残り時間に詰める LPT/smart-scheduling が効率に効く
+
+途中再開可能なジョブで安易に有効化するのは非推奨: `JOBSCHEDULER_ESTIMATE_TIME` の推定が外れたり `--max-runtime` を短くしたりすると **全ジョブが除外され、何も走らないまま課金だけされる** 事故が起きやすい。
+
 ```bash
 # 24時間以内に終わらせる、最後の5分は余裕を持つ
+# （--max-runtime のみ → 全体ループ&各ジョブの時間上限のみ。ESTIMATE_TIME は見ない）
 job_scheduler jobs.db "bash run.sh" \
     --max-runtime 86400 \
     --margin-time 300
+
+# ESTIMATE_TIME によるフィルタも有効化（残り時間に収まらないジョブを除外）
+job_scheduler jobs.db "bash run.sh" \
+    --max-runtime 86400 \
+    --margin-time 300 \
+    --smart-scheduling true
 ```
 
 ### パターン4: 失敗したジョブだけリトライ
@@ -196,9 +213,9 @@ progress_viewer jobs.db
 # - Waiting: 依存ジョブが running/pending
 # - Blocked: 依存ジョブが error
 # - Ready: すぐに実行可能
-
-# estimate_time が大きすぎると、残り時間内に収まらないので実行されない
 ```
+
+`--smart-scheduling true` を明示的に付けている場合、`JOBSCHEDULER_ESTIMATE_TIME * 3600 / speed_factor` が `--max-runtime` の残りより大きいジョブはすべて除外され、何も走らない状態になる。デフォルトでは無効なのでこの挙動は起きないが、有効化していて止まっているなら外す（`--smart-scheduling false` または引数自体を外す）。
 
 ### Q: 途中でジョブが止まった
 

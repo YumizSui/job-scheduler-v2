@@ -133,6 +133,32 @@ class TestLongestFirst(unittest.TestCase):
         # 3時間ジョブは除外され、残りの中で最長の2時間ジョブが選ばれる
         self.assertEqual(job["JOBSCHEDULER_JOB_ID"], "job_2h")
 
+    def test_default_no_max_runtime_disables_smart_scheduling(self):
+        """--max-runtime 未指定時は --smart-scheduling=True でも無効化される"""
+        db = create_test_db(self.tmpdir)
+        s = JobScheduler(
+            db_path=db,
+            command="echo",
+            smart_scheduling=True,  # 明示的にTrueでも、max_runtime無しなら無効化される
+        )
+        self.assertFalse(s.smart_scheduling)
+        self.assertIsNone(s.max_runtime)
+
+    def test_get_pending_job_with_none_available_time(self):
+        """available_time=None なら ESTIMATE_TIME によるフィルタは走らない"""
+        db = create_test_db(self.tmpdir)
+        # 巨大な estimate_time を持つジョブでも、None なら通る
+        insert_job(db, "job_huge", priority=0, estimate_time=1000.0)
+
+        s = JobScheduler(
+            db_path=db,
+            command="echo",
+            # max_runtime=None → smart_scheduling は自動で無効化
+        )
+        job = s.get_pending_job(available_time=None)
+        self.assertIsNotNone(job)
+        self.assertEqual(job["JOBSCHEDULER_JOB_ID"], "job_huge")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

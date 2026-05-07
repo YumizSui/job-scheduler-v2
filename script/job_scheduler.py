@@ -69,11 +69,20 @@ class JobScheduler:
     def __init__(self, db_path: str, command: str, **kwargs):
         self.db_path = db_path
         self.command = command
-        self.max_runtime = kwargs.get('max_runtime', 86400)
+        self.max_runtime = kwargs.get('max_runtime', None)
         self.margin_time = kwargs.get('margin_time', 0)
         self.speed_factor = kwargs.get('speed_factor', 1.0)
-        self.smart_scheduling = kwargs.get('smart_scheduling', True)
+        self.smart_scheduling = kwargs.get('smart_scheduling', False)
         self.longest_first = kwargs.get('longest_first', False)
+
+        # Smart scheduling needs available_time, which is derived from max_runtime.
+        # Without max_runtime there is nothing to schedule against, so disable.
+        if self.smart_scheduling and self.max_runtime is None:
+            logging.warning(
+                "smart-scheduling requested without --max-runtime; disabling "
+                "(JOBSCHEDULER_ESTIMATE_TIME will be ignored)."
+            )
+            self.smart_scheduling = False
         self.named_args = kwargs.get('named_args', False)
         self.parallel = kwargs.get('parallel', 1)
         self.dep_wait_interval = kwargs.get('dep_wait_interval', 30)
@@ -120,7 +129,7 @@ class JobScheduler:
 
         return conn
 
-    def get_pending_job(self, available_time: float, target_job_ids: Optional[list] = None) -> Optional[Dict]:
+    def get_pending_job(self, available_time: Optional[float], target_job_ids: Optional[list] = None) -> Optional[Dict]:
         """
         Get next pending job based on priority and estimate_time.
 
@@ -142,7 +151,7 @@ class JobScheduler:
             job_id_filter = f"AND JOBSCHEDULER_JOB_ID IN ({placeholders})"
             job_id_params = list(target_job_ids)
 
-        if self.smart_scheduling and available_time > 0:
+        if self.smart_scheduling and available_time is not None and available_time > 0:
             select_query = f"""
                 SELECT * FROM jobs
                 WHERE JOBSCHEDULER_STATUS = 'pending'
@@ -457,7 +466,7 @@ class JobScheduler:
             except subprocess.TimeoutExpired:
                 logging.error(f"Job {job_id} pgid {pgid} did not respond to SIGKILL.")
 
-    def run_job(self, job: Dict, max_time: float, worker_id: int = 0) -> Tuple[int, float, Optional[str]]:
+    def run_job(self, job: Dict, max_time: Optional[float], worker_id: int = 0) -> Tuple[int, float, Optional[str]]:
         """
         Execute a single job
 
@@ -521,12 +530,12 @@ class JobScheduler:
             stdout_thread.start()
             stderr_thread.start()
 
-            # Wait for completion with timeout
-            end_time = start_time + max_time
+            # Wait for completion. Per-job timeout only enforced when max_time is set.
+            end_time = (start_time + max_time) if max_time is not None else None
             return_code = None
 
             while process.poll() is None and not shutdown_event.is_set() and not kill_event.is_set():
-                if time.time() >= end_time:
+                if end_time is not None and time.time() >= end_time:
                     logging.warning(f"Job {job_id} exceeded maximum runtime. Terminating.")
                     self._terminate_process_group(process, job_id)
                     return_code = -2
@@ -613,17 +622,17 @@ class JobScheduler:
         remaining_targets = list(self.target_jobs) if self.target_jobs else None
 
         while not shutdown_event.is_set():
-            elapsed = time.time() - self.start_time
-
-            if elapsed >= self.max_runtime:
-                logging.info("Reached maximum total runtime. Stopping.")
-                break
-
-            available_time = self.max_runtime - elapsed - self.margin_time
-
-            if available_time <= 0:
-                logging.info("Not enough available time remaining (considering margin). Stopping.")
-                break
+            if self.max_runtime is not None:
+                elapsed = time.time() - self.start_time
+                if elapsed >= self.max_runtime:
+                    logging.info("Reached maximum total runtime. Stopping.")
+                    break
+                available_time = self.max_runtime - elapsed - self.margin_time
+                if available_time <= 0:
+                    logging.info("Not enough available time remaining (considering margin). Stopping.")
+                    break
+            else:
+                available_time = None
 
             # Periodically recover stuck jobs (worker 0 only to avoid contention)
             now = time.time()
@@ -727,10 +736,16 @@ class JobScheduler:
         logging.info(f"Database: {self.db_path}")
         logging.info(f"Worker ID: {self.worker_id}")
         logging.info(f"Command: {self.command}")
-        logging.info(f"Max runtime: {self.max_runtime}s")
+        if self.max_runtime is not None:
+            logging.info(f"Max runtime: {self.max_runtime}s")
+        else:
+            logging.info("Max runtime: unlimited (no --max-runtime)")
         logging.info(f"Margin time: {self.margin_time}s")
         logging.info(f"Speed factor: {self.speed_factor}")
-        logging.info(f"Smart scheduling: {self.smart_scheduling}")
+        if self.smart_scheduling:
+            logging.info("Smart scheduling: True")
+        else:
+            logging.info("Smart scheduling: False (JOBSCHEDULER_ESTIMATE_TIME ignored)")
         logging.info(f"Longest first: {self.longest_first}")
         logging.info(f"Named args: {self.named_args}")
         logging.info(f"Parallel: {self.parallel}")
@@ -793,8 +808,8 @@ Examples:
   # Python script with named arguments
   job_scheduler jobs.db "python run.py" --named-args
 
-  # With time constraints
-  job_scheduler jobs.db "bash run.sh" --max-runtime 3600 --margin-time 300
+  # With time constraints (opt-in; otherwise unlimited and ESTIMATE_TIME is ignored)
+  job_scheduler jobs.db "bash run.sh" --max-runtime 3600 --margin-time 300 --smart-scheduling true
 
   # Parallel execution
   job_scheduler jobs.db "bash run.sh" --parallel 4
@@ -810,16 +825,19 @@ Examples:
     parser.add_argument('db_file', help='SQLite database file path')
     parser.add_argument('command', help='Command to execute for each job')
 
-    parser.add_argument('--max-runtime', type=int, default=86400,
-                       help='Maximum total runtime in seconds (default: 86400 = 24h)')
+    parser.add_argument('--max-runtime', type=int, default=None,
+                       help='Maximum total runtime in seconds. Unset = no limit (default). '
+                            'Also caps each job to the remaining budget.')
     parser.add_argument('--margin-time', type=int, default=0,
-                       help='Margin time in seconds (default: 0)')
+                       help='Margin time in seconds, subtracted from --max-runtime when computing remaining budget (default: 0)')
     parser.add_argument('--speed-factor', type=float, default=1.0,
                        help='Speed factor for time estimation (default: 1.0)')
-    parser.add_argument('--smart-scheduling', type=lambda x: x.lower() != 'false', default=True,
-                       help='Enable smart scheduling based on estimate_time (default: true)')
+    parser.add_argument('--smart-scheduling', type=lambda x: x.lower() == 'true', default=False,
+                       help='Filter pending jobs whose JOBSCHEDULER_ESTIMATE_TIME exceeds the remaining budget. '
+                            'Off by default; requires --max-runtime to be set.')
     parser.add_argument('--longest-first', action='store_true',
-                       help='Schedule longest estimated jobs first within same priority (LPT strategy, default: false)')
+                       help='Order jobs of equal priority by JOBSCHEDULER_ESTIMATE_TIME descending (LPT strategy). '
+                            'Off by default. Uses ESTIMATE_TIME purely for sorting; does not filter.')
     parser.add_argument('--named-args', action='store_true',
                        help='Pass arguments as --key value instead of positional')
     parser.add_argument('--parallel', type=int, default=1,

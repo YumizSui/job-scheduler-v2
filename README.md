@@ -12,7 +12,7 @@ SQLite-based parallel job scheduler for HPC environments (TSUBAME, etc.)
 - ✅ **Safe Concurrent Access**: SQLite with atomic transactions for multi-node safety
 - ✅ **Job Dependencies**: DAG-based dependency management (job dependencies)
 - ✅ **Priority Scheduling**: Execute important jobs first
-- ✅ **Smart Scheduling**: Consider remaining time for job selection
+- ✅ **Smart Scheduling (opt-in)**: Filter pending jobs that won't fit in the remaining wall-clock budget. Off by default — useful only for non-resumable jobs, otherwise an inaccurate `JOBSCHEDULER_ESTIMATE_TIME` can cause every job to be filtered out and the run wastes points doing nothing
 - ✅ **Flexible Arguments**: Support both positional and named arguments
 - ✅ **Real-time Output**: Stream stdout/stderr in real-time
 - ✅ **Automatic Recovery**: Bidirectional reconciliation between DB status and heartbeat files (stuck jobs → pending, live jobs wrongly reset → running)

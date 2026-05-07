@@ -81,16 +81,23 @@ uv sync   # .venv を構築（rich + textual をインストール）
 ### 基本的な使用例
 
 ```bash
-# シングルノードで実行
+# シングルノードで実行（時間制限なし、ESTIMATE_TIMEは無視）
 job_scheduler jobs.db "bash run.sh"
 
 # 並列実行（1ノード内で4並列）
 job_scheduler jobs.db "bash run.sh" --parallel 4
 
 # 時間制約付き（24時間以内、最後5分はマージン）
+# --max-runtime を指定すると、全体ループ・各ジョブともに上限が効く
 job_scheduler jobs.db "bash run.sh" \
     --max-runtime 86400 \
     --margin-time 300
+
+# ESTIMATE_TIME ベースのフィルタ（再開不可ジョブ向け、--max-runtime とセットで指定）
+job_scheduler jobs.db "bash run.sh" \
+    --max-runtime 86400 \
+    --margin-time 300 \
+    --smart-scheduling true
 ```
 
 ### TSUBAMEでの複数ノード実行
@@ -261,11 +268,16 @@ job_scheduler <db_file> <command> [options]
   command               各ジョブで実行するコマンド
 
 オプション:
-  --max-runtime SEC     最大実行時間（秒）（デフォルト: 86400 = 24時間）
-  --margin-time SEC     安全マージン時間（秒）（デフォルト: 0）
+  --max-runtime SEC     最大実行時間（秒）。**未指定なら無制限**（デフォルト）。
+                        指定するとスケジューラ全体ループも各ジョブも上限が効く。
+  --margin-time SEC     安全マージン時間（秒、--max-runtime から減算）（デフォルト: 0）
   --speed-factor FLOAT  時間推定の速度係数（デフォルト: 1.0）
-  --smart-scheduling    賢いスケジューリングを有効化（デフォルト: true）
-  --longest-first       同一優先度内で推定時間が長いジョブを優先（LPT戦略、デフォルト: false）
+  --smart-scheduling true|false
+                        JOBSCHEDULER_ESTIMATE_TIME が残り時間に収まらないジョブを除外。
+                        **デフォルト false。明示的に true、かつ --max-runtime とセットで指定が必要。**
+                        --max-runtime 無しで true を渡すと警告ログを出して自動的に無効化される。
+  --longest-first       同一優先度内で推定時間が長いジョブを優先（LPT戦略、デフォルト: false）。
+                        ESTIMATE_TIME を並び順にしか使わず、ジョブの除外はしない。
   --named-args          名前付き引数モード（--key value形式）
   --parallel N          並列実行数（デフォルト: 1）
   --dep-wait-interval SEC  依存待ち時の待機間隔（秒）（デフォルト: 30）
@@ -283,7 +295,7 @@ job_scheduler <db_file> <command> [options]
 - `JOBSCHEDULER_JOB_ID` - ジョブの一意識別子
 - `JOBSCHEDULER_STATUS` - ジョブのステータス（pending/running/done/error）
 - `JOBSCHEDULER_PRIORITY` - 優先度（大きいほど先に実行）
-- `JOBSCHEDULER_ESTIMATE_TIME` - 推定実行時間（時間単位）
+- `JOBSCHEDULER_ESTIMATE_TIME` - 推定実行時間（時間単位）。**デフォルトでは無視され、`--smart-scheduling true` または `--longest-first` を付けたときのみ参照される**。途中再開可能なジョブでは設定しない方が安全（推定誤差で全ジョブ除外の事故が起きうる）
 - `JOBSCHEDULER_ELAPSED_TIME` - 実際の実行時間（秒単位）
 - `JOBSCHEDULER_DEPENDS_ON` - 依存ジョブID（スペース区切り）
 - `JOBSCHEDULER_CREATED_AT` - 作成日時
@@ -301,8 +313,11 @@ job_scheduler <db_file> <command> [options]
 1. **ジョブ選択**: `pending`状態かつ依存関係が満たされたジョブを取得
    - 依存ジョブが全て`done`になっているジョブのみ選択
    - `JOBSCHEDULER_PRIORITY`の降順でソート
-   - `smart-scheduling=true`の場合、残り時間内に収まるジョブのみ選択
+   - `--smart-scheduling true`（要 `--max-runtime`）の場合、残り時間内に収まらないジョブを除外
    - `--longest-first`の場合、同一優先度内で`JOBSCHEDULER_ESTIMATE_TIME`の降順でソート（LPT戦略）
+
+   **デフォルトでは `JOBSCHEDULER_ESTIMATE_TIME` も `--max-runtime` も効かない**。
+   ESTIMATE_TIME は ① 途中で打ち切られると最初からやり直しになるジョブで確実に終わる分だけ流したい、② ジョブ実行時間が大きくばらつき LPT で詰めたい、といった限定された場面でのみ有効化する。途中再開可能なジョブで `--smart-scheduling true` を有効にすると、推定が外れたとき全ジョブが除外されてポイントだけ消費する事故が起きやすい。
 
 2. **ステータス更新**: `running`に変更、`JOBSCHEDULER_STARTED_AT`を記録
 
@@ -360,10 +375,14 @@ db_util recover jobs.db --direction mismatch
 ```bash
 # ステータス確認（依存状態も表示）
 progress_viewer jobs.db
+```
 
-# estimate_timeが大きすぎて残り時間内に収まらない場合
-# → smart-schedulingを無効化
-job_scheduler jobs.db "bash run.sh" --smart-scheduling false
+`--smart-scheduling true` を付けて `JOBSCHEDULER_ESTIMATE_TIME` が `--max-runtime` の残りより大きいと、すべての pending ジョブが除外されて何も走らない状態になる。デフォルトでは smart-scheduling は無効なのでこの挙動は起きないが、明示的に有効化していて止まっている場合は外す:
+
+```bash
+# smart-scheduling を付けない（=デフォルト）か、明示的に false に
+job_scheduler jobs.db "bash run.sh" --max-runtime 86400
+job_scheduler jobs.db "bash run.sh" --max-runtime 86400 --smart-scheduling false
 ```
 
 ### Q: 依存ジョブがエラーでブロックされている
