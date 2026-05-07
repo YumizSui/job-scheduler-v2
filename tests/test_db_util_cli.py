@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Tests for db_util CLI extensions: show, list, stats --by, injection guards."""
 
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -195,3 +198,106 @@ def test_readonly_cannot_write(db_path):
     with JobDatabase(db_path, read_only=True) as db:
         with pytest.raises(Exception):
             db.conn.execute("UPDATE jobs SET JOBSCHEDULER_STATUS = 'done'")
+
+
+# --- reconcile_running_jobs ---
+
+def _set_status(db_path, job_id, status):
+    with JobDatabase(db_path) as db:
+        db.conn.execute(
+            "UPDATE jobs SET JOBSCHEDULER_STATUS = ? WHERE JOBSCHEDULER_JOB_ID = ?",
+            (status, job_id),
+        )
+        db.conn.commit()
+
+
+def _make_heartbeat(db_path, job_id, age_seconds=0.0):
+    """Create a heartbeat file whose mtime is `age_seconds` old."""
+    hb_dir = Path(db_path + ".heartbeat")
+    hb_dir.mkdir(parents=True, exist_ok=True)
+    f = hb_dir / job_id
+    f.touch()
+    if age_seconds > 0:
+        mtime = time.time() - age_seconds
+        os.utime(f, (mtime, mtime))
+    return f
+
+
+def test_reconcile_restores_fresh_heartbeat_jobs(db_path):
+    # job_00000004 is pending, give it a fresh heartbeat; job_00000000 is error, give it a stale one.
+    _make_heartbeat(db_path, "job_00000004", age_seconds=0)
+    _make_heartbeat(db_path, "job_00000000", age_seconds=600)  # way past threshold
+    with JobDatabase(db_path) as db:
+        reconciled = db.reconcile_running_jobs(fresh_threshold=120)
+    assert reconciled == 1
+    with JobDatabase(db_path, read_only=True) as db:
+        assert db.get_job("job_00000004")["JOBSCHEDULER_STATUS"] == "running"
+        assert db.get_job("job_00000000")["JOBSCHEDULER_STATUS"] == "error"
+
+
+def test_reconcile_no_op_when_status_already_running(db_path):
+    _set_status(db_path, "job_00000004", "running")
+    _make_heartbeat(db_path, "job_00000004", age_seconds=0)
+    with JobDatabase(db_path) as db:
+        reconciled = db.reconcile_running_jobs(fresh_threshold=120)
+    assert reconciled == 0
+
+
+def test_reconcile_no_op_when_heartbeat_dir_missing(tmp_path):
+    p = str(tmp_path / "empty.db")
+    with JobDatabase(p) as db:
+        db.create_schema()
+        db.conn.execute(
+            "INSERT INTO jobs (JOBSCHEDULER_JOB_ID, JOBSCHEDULER_STATUS) VALUES (?, ?)",
+            ("job_x", "pending"),
+        )
+        db.conn.commit()
+        reconciled = db.reconcile_running_jobs(fresh_threshold=120)
+    assert reconciled == 0
+
+
+def test_reset_then_auto_reconcile_via_cli(db_path):
+    # Set up: fresh heartbeat for job_00000000 (currently error), stale for job_00000002.
+    _make_heartbeat(db_path, "job_00000000", age_seconds=0)
+    _make_heartbeat(db_path, "job_00000002", age_seconds=600)
+
+    script = Path(__file__).parent.parent / "script" / "db_util.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "reset", db_path, "--set-status", "error"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    # Reset flipped everything to error, then reconcile should restore fresh-heartbeat job(s).
+    assert "Reconciled" in result.stdout or "Restored" in result.stdout
+
+    with JobDatabase(db_path, read_only=True) as db:
+        assert db.get_job("job_00000000")["JOBSCHEDULER_STATUS"] == "running"
+        # Stale heartbeat → stays error after reset
+        assert db.get_job("job_00000002")["JOBSCHEDULER_STATUS"] == "error"
+
+
+def test_recover_subcommand_both_directions(db_path):
+    # Mismatch case: pending job with fresh heartbeat → should become running
+    _make_heartbeat(db_path, "job_00000004", age_seconds=0)
+    # Stuck case: running job with stale DB heartbeat (no heartbeat file) → should become pending
+    _set_status(db_path, "job_00000003", "running")
+    with JobDatabase(db_path) as db:
+        db.conn.execute(
+            "UPDATE jobs SET JOBSCHEDULER_HEARTBEAT = datetime('now', '-1 hour') "
+            "WHERE JOBSCHEDULER_JOB_ID = ?",
+            ("job_00000003",),
+        )
+        db.conn.commit()
+
+    script = Path(__file__).parent.parent / "script" / "db_util.py"
+    subprocess.run(
+        [sys.executable, str(script), "recover", db_path, "--direction", "both"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    with JobDatabase(db_path, read_only=True) as db:
+        assert db.get_job("job_00000004")["JOBSCHEDULER_STATUS"] == "running"
+        assert db.get_job("job_00000003")["JOBSCHEDULER_STATUS"] == "pending"

@@ -248,6 +248,91 @@ class ProgressViewer:
 
         return len(stuck_job_ids)
 
+    def reconcile_running_jobs(self) -> int:
+        """Flip jobs back to 'running' when heartbeat file is fresh but status is not.
+
+        Reverse of recover_stuck_jobs(): handles the case where status was
+        bulk-reset or otherwise corrupted away from 'running' while the worker
+        is still alive and touching its heartbeat file.
+
+        Returns the number of jobs reconciled.
+        """
+        hb_dir = Path(self.db_path + ".heartbeat")
+        if not hb_dir.exists():
+            return 0
+
+        now = time.time()
+        fresh_ages: Dict[str, float] = {}
+        for hb_file in hb_dir.iterdir():
+            if hb_file.name.endswith('.kill'):
+                continue
+            try:
+                age = now - hb_file.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age <= self.stale_threshold:
+                fresh_ages[hb_file.name] = age
+
+        if not fresh_ages:
+            return 0
+
+        fresh_ids = list(fresh_ages.keys())
+        placeholders = ','.join('?' * len(fresh_ids))
+        conn = self.connect_db()
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_STATUS
+                FROM jobs
+                WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+                AND JOBSCHEDULER_STATUS != 'running'
+                """,
+                fresh_ids,
+            )
+            mismatched = cursor.fetchall()
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Failed to query mismatched jobs: {e}", file=sys.stderr)
+            return 0
+        finally:
+            conn.close()
+
+        if not mismatched:
+            return 0
+
+        mismatched_ids = [row[0] for row in mismatched]
+        for row in mismatched:
+            job_id, old_status = row[0], row[1]
+            age = fresh_ages.get(job_id, 0.0)
+            print(f"  Reconciled: {job_id} (status: {old_status} → running, heartbeat_age={age:.0f}s)")
+
+        placeholders = ','.join('?' * len(mismatched_ids))
+        conn = self.connect_db_rw()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                f"""
+                UPDATE jobs
+                SET JOBSCHEDULER_STATUS = 'running',
+                    JOBSCHEDULER_HEARTBEAT = datetime('now'),
+                    JOBSCHEDULER_FINISHED_AT = NULL,
+                    JOBSCHEDULER_ELAPSED_TIME = NULL,
+                    JOBSCHEDULER_ERROR_MESSAGE = NULL,
+                    JOBSCHEDULER_STARTED_AT = COALESCE(JOBSCHEDULER_STARTED_AT, datetime('now'))
+                WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+                AND JOBSCHEDULER_STATUS != 'running'
+                """,
+                mismatched_ids,
+            )
+            conn.commit()
+            print(f"[Reconcile] Restored {len(mismatched_ids)} job(s) to 'running' (heartbeat threshold: {self.stale_threshold}s)")
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Failed to reconcile running jobs: {e}", file=sys.stderr)
+            return 0
+        finally:
+            conn.close()
+
+        return len(mismatched_ids)
+
     def _step(self, msg: str) -> None:
         print(f"\r[{datetime.now().strftime('%H:%M:%S')}] {msg}...", end="", flush=True, file=sys.stderr)
 
@@ -259,6 +344,8 @@ class ProgressViewer:
         if self.auto_recover:
             self._step("Checking stuck jobs")
             self.recover_stuck_jobs()
+            self._step("Reconciling heartbeat status")
+            self.reconcile_running_jobs()
 
         self._step("Fetching stats")
         stats = self.get_stats()

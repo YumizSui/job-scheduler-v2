@@ -12,6 +12,7 @@ Provides functions to:
 import sqlite3
 import csv
 import sys
+import time
 import argparse
 from typing import List, Dict, Optional
 from pathlib import Path
@@ -382,43 +383,141 @@ class JobDatabase:
     def recover_stuck_jobs(self, stale_threshold: int = 120) -> int:
         """Recover jobs stuck in 'running' state with stale or missing heartbeat.
 
+        Uses file-based heartbeat (mtime) as primary signal — mirrors the logic in
+        job_scheduler.py and progress_viewer.py so all three tools agree on what
+        "stuck" means. Falls back to the DB heartbeat column for workers that
+        predate the file-based mechanism.
+
         Returns the number of jobs recovered.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
+        hb_dir = Path(self.db_path + ".heartbeat")
+        now = time.time()
 
         cursor = self.conn.execute("""
-            SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID, JOBSCHEDULER_HEARTBEAT
-            FROM jobs
-            WHERE JOBSCHEDULER_STATUS = 'running'
-            AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                 OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
+            SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_WORKER_ID,
+                   CASE WHEN JOBSCHEDULER_HEARTBEAT IS NULL THEN 1
+                        WHEN JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds') THEN 1
+                        ELSE 0 END as db_stale
+            FROM jobs WHERE JOBSCHEDULER_STATUS = 'running'
         """, (stale_threshold,))
-        stuck_jobs = cursor.fetchall()
+        running_jobs = cursor.fetchall()
 
-        if stuck_jobs:
-            for row in stuck_jobs:
-                job_id = row[0]
-                worker_id = row[1] or 'unknown'
-                heartbeat = row[2] or 'never'
-                print(f"  Recovering stuck job: {job_id} (worker={worker_id}, last_heartbeat={heartbeat})")
+        stuck_job_ids = []
+        for row in running_jobs:
+            job_id, worker_id, db_stale = row[0], (row[1] or 'unknown'), row[2]
+            hb_file = hb_dir / job_id if hb_dir.exists() else None
 
-            self.conn.execute("""
-                UPDATE jobs
-                SET JOBSCHEDULER_STATUS = 'pending',
-                    JOBSCHEDULER_STARTED_AT = NULL,
-                    JOBSCHEDULER_HEARTBEAT = NULL,
-                    JOBSCHEDULER_WORKER_ID = NULL,
-                    JOBSCHEDULER_KILL_REQUESTED = NULL
-                WHERE JOBSCHEDULER_STATUS = 'running'
-                AND (JOBSCHEDULER_HEARTBEAT IS NULL
-                     OR JOBSCHEDULER_HEARTBEAT < datetime('now', '-' || ? || ' seconds'))
-            """, (stale_threshold,))
-            self.conn.commit()
-            print(f"[Recovery] Reset {len(stuck_jobs)} stuck job(s) to 'pending' (heartbeat threshold: {stale_threshold}s)")
-        else:
-            self.conn.commit()
+            if hb_file is not None and hb_file.exists():
+                try:
+                    age = now - hb_file.stat().st_mtime
+                except FileNotFoundError:
+                    age = float('inf')
+                if age > stale_threshold:
+                    print(f"  Recovering stuck job: {job_id} (worker={worker_id}, heartbeat_age={age:.0f}s)")
+                    stuck_job_ids.append(job_id)
+            elif db_stale:
+                print(f"  Recovering stuck job: {job_id} (worker={worker_id}, no heartbeat file, db heartbeat stale)")
+                stuck_job_ids.append(job_id)
 
-        return len(stuck_jobs)
+        if not stuck_job_ids:
+            return 0
+
+        placeholders = ','.join('?' * len(stuck_job_ids))
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.conn.execute(
+            f"""
+            UPDATE jobs
+            SET JOBSCHEDULER_STATUS = 'pending',
+                JOBSCHEDULER_STARTED_AT = NULL,
+                JOBSCHEDULER_HEARTBEAT = NULL,
+                JOBSCHEDULER_WORKER_ID = NULL,
+                JOBSCHEDULER_KILL_REQUESTED = NULL
+            WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+            AND JOBSCHEDULER_STATUS = 'running'
+            """,
+            stuck_job_ids,
+        )
+        self.conn.commit()
+        print(f"[Recovery] Reset {len(stuck_job_ids)} stuck job(s) to 'pending' (heartbeat threshold: {stale_threshold}s)")
+
+        if hb_dir.exists():
+            for job_id in stuck_job_ids:
+                try:
+                    (hb_dir / job_id).unlink(missing_ok=True)
+                    (hb_dir / f"{job_id}.kill").unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        return len(stuck_job_ids)
+
+    def reconcile_running_jobs(self, fresh_threshold: int = 120) -> int:
+        """Flip jobs back to 'running' when heartbeat file is fresh but status is not.
+
+        Reverse of recover_stuck_jobs(): fixes cases where status was bulk-reset
+        or otherwise corrupted away from 'running' while the worker is still
+        alive and touching its heartbeat file.
+
+        Returns the number of jobs reconciled.
+        """
+        hb_dir = Path(self.db_path + ".heartbeat")
+        if not hb_dir.exists():
+            return 0
+
+        now = time.time()
+        fresh_ages: Dict[str, float] = {}
+        for hb_file in hb_dir.iterdir():
+            if hb_file.name.endswith('.kill'):
+                continue
+            try:
+                age = now - hb_file.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age <= fresh_threshold:
+                fresh_ages[hb_file.name] = age
+
+        if not fresh_ages:
+            return 0
+
+        fresh_ids = list(fresh_ages.keys())
+        placeholders = ','.join('?' * len(fresh_ids))
+        cursor = self.conn.execute(
+            f"""
+            SELECT JOBSCHEDULER_JOB_ID, JOBSCHEDULER_STATUS
+            FROM jobs
+            WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+            AND JOBSCHEDULER_STATUS != 'running'
+            """,
+            fresh_ids,
+        )
+        mismatched = cursor.fetchall()
+        if not mismatched:
+            return 0
+
+        mismatched_ids = [row[0] for row in mismatched]
+        for row in mismatched:
+            job_id, old_status = row[0], row[1]
+            age = fresh_ages.get(job_id, 0.0)
+            print(f"  Reconciled: {job_id} (status: {old_status} → running, heartbeat_age={age:.0f}s)")
+
+        placeholders = ','.join('?' * len(mismatched_ids))
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.conn.execute(
+            f"""
+            UPDATE jobs
+            SET JOBSCHEDULER_STATUS = 'running',
+                JOBSCHEDULER_HEARTBEAT = datetime('now'),
+                JOBSCHEDULER_FINISHED_AT = NULL,
+                JOBSCHEDULER_ELAPSED_TIME = NULL,
+                JOBSCHEDULER_ERROR_MESSAGE = NULL,
+                JOBSCHEDULER_STARTED_AT = COALESCE(JOBSCHEDULER_STARTED_AT, datetime('now'))
+            WHERE JOBSCHEDULER_JOB_ID IN ({placeholders})
+            AND JOBSCHEDULER_STATUS != 'running'
+            """,
+            mismatched_ids,
+        )
+        self.conn.commit()
+        print(f"[Reconcile] Restored {len(mismatched_ids)} job(s) to 'running' (heartbeat threshold: {fresh_threshold}s)")
+        return len(mismatched_ids)
 
     def get_stats(self) -> Dict[str, int]:
         """Get job statistics"""
@@ -775,6 +874,22 @@ def main():
     reset_parser.add_argument('--set-status', dest='set_status', default='pending',
                               choices=['pending', 'done', 'error', 'running'],
                               help='Target status to set jobs to (default: pending)')
+    reset_parser.add_argument('--stale-threshold', type=int, default=120,
+                              help='Seconds within which a heartbeat is considered fresh; '
+                                   'jobs with a fresh heartbeat are restored to running after reset (default: 120)')
+
+    # recover: db_file — reconcile DB status with heartbeat files (both directions)
+    recover_parser = subparsers.add_parser(
+        'recover',
+        help='Reconcile DB status with heartbeat files (both directions)',
+    )
+    recover_parser.add_argument('db_file', help='SQLite database file path')
+    recover_parser.add_argument('--stale-threshold', type=int, default=120,
+                                help='Seconds threshold for stale/fresh heartbeat (default: 120)')
+    recover_parser.add_argument('--direction', choices=['both', 'stuck', 'mismatch'], default='both',
+                                help="both: run both checks (default); "
+                                     "stuck: only 'running→pending' for stale heartbeats; "
+                                     "mismatch: only 'pending/error→running' for fresh heartbeats")
 
     # kill: db_file --jobs JOB_IDS
     kill_parser = subparsers.add_parser('kill', help='Request termination of running jobs (marks for force kill)')
@@ -816,6 +931,7 @@ def main():
         with JobDatabase(args.db_file) as db:
             if not args.no_recover:
                 db.recover_stuck_jobs(stale_threshold=args.stale_threshold)
+                db.reconcile_running_jobs(fresh_threshold=args.stale_threshold)
             stats = db.get_stats()
             print("\nJob Statistics:")
             print(f"  Total: {stats.get('total', 0)}")
@@ -848,6 +964,21 @@ def main():
                 print(f"✓ Reset {count} jobs to {set_status} status")
             for jid in missing:
                 print(f"  Warning: job ID not found: {jid}")
+
+            if set_status != 'running':
+                db.reconcile_running_jobs(fresh_threshold=args.stale_threshold)
+
+    # Handle recover
+    elif args.command == 'recover':
+        if not Path(args.db_file).exists():
+            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        with JobDatabase(args.db_file) as db:
+            if not db.table_exists():
+                sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
+            if args.direction in ('both', 'stuck'):
+                db.recover_stuck_jobs(stale_threshold=args.stale_threshold)
+            if args.direction in ('both', 'mismatch'):
+                db.reconcile_running_jobs(fresh_threshold=args.stale_threshold)
 
     # Handle kill
     elif args.command == 'kill':
