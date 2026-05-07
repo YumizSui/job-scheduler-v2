@@ -63,6 +63,10 @@ class ConfirmModal(ModalScreen[bool]):
         Binding("y", "confirm_yes", "Yes", priority=True),
         Binding("n", "confirm_no", "No", priority=True),
         Binding("escape", "confirm_no", "Cancel", priority=True),
+        Binding("left", "focus_prev", show=False),
+        Binding("right", "focus_next", show=False),
+        Binding("h", "focus_prev", show=False),
+        Binding("l", "focus_next", show=False),
     ]
 
     def __init__(self, message: str) -> None:
@@ -73,8 +77,8 @@ class ConfirmModal(ModalScreen[bool]):
         yield Vertical(
             Label(self._message, id="confirm-message"),
             Horizontal(
-                Button("Yes (y)", id="confirm-yes", variant="error"),
-                Button("No (n)", id="confirm-no", variant="primary"),
+                Button("Yes (y)", id="confirm-yes"),
+                Button("No (n)", id="confirm-no"),
                 id="confirm-buttons",
             ),
             id="confirm-dialog",
@@ -85,6 +89,12 @@ class ConfirmModal(ModalScreen[bool]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm-yes")
+
+    def action_focus_prev(self) -> None:
+        self.focus_previous()
+
+    def action_focus_next(self) -> None:
+        self.focus_next()
 
     def action_confirm_yes(self) -> None:
         self.dismiss(True)
@@ -169,7 +179,8 @@ class JobTUI(App):
         Binding("s", "cycle_sort", "Sort"),
         Binding("p", "toggle_pause", "Pause"),
         Binding("r", "refresh_now", "Refresh"),
-        Binding("q", "quit", "Quit"),
+        Binding("q", "confirm_quit", "Quit"),
+        Binding("escape", "confirm_quit", "Quit", show=False),
         Binding("ctrl+r", "reset_job", "Reset→pending", priority=True),
         Binding("ctrl+k", "kill_job", "Kill", priority=True),
     ]
@@ -359,6 +370,7 @@ class JobTUI(App):
             filter_bar = self.query_one("#filter-bar", Input)
             if filter_bar.has_focus:
                 self.query_one("#job-table", DataTable).focus()
+                event.stop()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self._filter_text = event.value
@@ -387,6 +399,12 @@ class JobTUI(App):
             _CONFIG_PATH.write_text(json.dumps(existing, indent=2))
         except OSError:
             pass
+
+    def action_confirm_quit(self) -> None:
+        def on_confirm(confirmed: bool) -> None:
+            if confirmed:
+                self.exit()
+        self.push_screen(ConfirmModal("Quit job_tui?"), on_confirm)
 
     # --- Actions only active with --enable-actions ---
 
