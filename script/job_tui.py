@@ -20,7 +20,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
 sys.path.insert(0, str(Path(__file__).parent))
-from db_util import JobDatabase
+from db_util import JobDatabase, check_db_path_or_exit
 
 DEFAULT_LIMIT = 500
 
@@ -460,8 +460,7 @@ def main():
                         help='Auto-refresh interval in seconds (default: 5.0)')
     args = parser.parse_args()
 
-    if not Path(args.db_path).exists():
-        sys.exit(f"Error: Database file does not exist: {args.db_path}")
+    check_db_path_or_exit(args.db_path)
 
     app = JobTUI(
         db_path=args.db_path,

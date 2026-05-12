@@ -27,6 +27,9 @@ from threading import Event, Thread
 from multiprocessing import Process, Value
 from pathlib import Path
 
+from db_util import validate_db_path
+
+
 def setup_logging(use_stderr=False):
     """Configure logging output destination."""
     stream = sys.stderr if use_stderr else sys.stdout
@@ -861,9 +864,10 @@ Examples:
     # Setup logging based on --log-stderr flag
     setup_logging(use_stderr=args.log_stderr)
 
-    # Validate
-    if not os.path.exists(args.db_file):
-        logging.error(f"Database file not found: {args.db_file}")
+    # Validate db_file (route the error through logging so --log-stderr applies)
+    db_path_error = validate_db_path(args.db_file)
+    if db_path_error is not None:
+        logging.error(db_path_error)
         sys.exit(1)
 
     if args.jobs_only and not args.jobs:

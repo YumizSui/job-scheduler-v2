@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from db_util import check_db_path_or_exit
+
 
 class ProgressViewer:
     """Progress viewer for job database"""
@@ -481,8 +483,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not Path(args.db_file).exists():
-        sys.exit(f"Error: Database file does not exist: {args.db_file}")
+    check_db_path_or_exit(args.db_file)
 
     viewer = ProgressViewer(args.db_file, stale_threshold=args.stale_threshold,
                             auto_recover=not args.no_recover)

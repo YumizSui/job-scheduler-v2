@@ -22,7 +22,7 @@ class TestLogOutput(unittest.TestCase):
             [sys.executable, SCRIPT, "nonexistent.db", "echo"],
             capture_output=True, text=True,
         )
-        self.assertIn("Database file not found", result.stdout)
+        self.assertIn("Database file does not exist", result.stdout)
         self.assertEqual(result.stderr, "")
 
     def test_log_stderr_logs_to_stderr(self):
@@ -31,7 +31,7 @@ class TestLogOutput(unittest.TestCase):
             [sys.executable, SCRIPT, "nonexistent.db", "echo", "--log-stderr"],
             capture_output=True, text=True,
         )
-        self.assertIn("Database file not found", result.stderr)
+        self.assertIn("Database file does not exist", result.stderr)
         self.assertEqual(result.stdout, "")
 
 

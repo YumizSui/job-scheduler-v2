@@ -18,6 +18,57 @@ from typing import List, Dict, Optional
 from pathlib import Path
 
 
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def validate_db_path(db_path: str, *, must_exist: bool = True) -> Optional[str]:
+    """Return an error message if db_path is not usable as a SQLite database
+    location, else None.
+
+    - must_exist=True : the file must already exist (read flows).
+    - must_exist=False: missing is OK (used by `db_util import` which creates).
+
+    Always rejects: directories, non-regular files (fifo/socket/broken symlink),
+    and existing non-empty files whose first 16 bytes are not the SQLite header.
+    An existing zero-byte file is accepted (sqlite3 will populate it on write).
+    """
+    p = Path(db_path)
+    if p.is_dir():
+        return f"'{db_path}' is a directory, not a SQLite database file."
+    if not p.exists():
+        if must_exist:
+            return f"Database file does not exist: {db_path}"
+        return None
+    if not p.is_file():
+        return f"'{db_path}' is not a regular file (not a SQLite database)."
+    if p.stat().st_size == 0:
+        return None
+    try:
+        with p.open("rb") as f:
+            header = f.read(16)
+    except OSError as e:
+        return f"cannot read '{db_path}': {e}"
+    if not header.startswith(SQLITE_MAGIC):
+        snippet = header[:30].decode("utf-8", errors="replace").replace("\n", "\\n")
+        return (
+            f"'{db_path}' is not a SQLite database file "
+            f"(first bytes: {snippet!r}). "
+            f"Hint: did you pass a CSV/text file or the wrong path?"
+        )
+    return None
+
+
+def check_db_path_or_exit(db_path: str, *, must_exist: bool = True) -> None:
+    """Validate db_path; on failure print `Error: ...` to stderr and sys.exit(1).
+
+    Convenience wrapper around `validate_db_path` for CLI entry points that
+    don't route errors through a logging facility.
+    """
+    err = validate_db_path(db_path, must_exist=must_exist)
+    if err is not None:
+        sys.exit(f"Error: {err}")
+
+
 class JobDatabase:
     """SQLite database manager for job scheduling"""
 
@@ -904,20 +955,20 @@ def main():
         csv_file = args.csv_file
         if Path(db_file).exists() and not args.force:
             sys.exit(f"Error: Database file already exists: {db_file}\nUse --force to overwrite.")
+        # Even with --force, refuse to overwrite a directory or non-SQLite file.
+        check_db_path_or_exit(db_file, must_exist=False)
         with JobDatabase(db_file) as db:
             db.import_csv(csv_file, reset_status=True)
 
     # Handle add
     elif args.command == 'add':
-        if not Path(args.db_path).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_path}")
+        check_db_path_or_exit(args.db_path)
         with JobDatabase(args.db_path) as db:
             db.add_csv(args.csv_file)
 
     # Handle export
     elif args.command == 'export':
-        if not Path(args.db_file).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        check_db_path_or_exit(args.db_file)
         csv_file = args.csv_path if args.csv_path else str(Path(args.db_file).with_suffix('.csv'))
         if Path(csv_file).exists() and not args.force:
             sys.exit(f"Error: CSV file already exists: {csv_file}\nUse --force to overwrite.")
@@ -926,8 +977,7 @@ def main():
 
     # Handle stats
     elif args.command == 'stats':
-        if not Path(args.db_file).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        check_db_path_or_exit(args.db_file)
         with JobDatabase(args.db_file) as db:
             if not args.no_recover:
                 db.recover_stuck_jobs(stale_threshold=args.stale_threshold)
@@ -945,8 +995,7 @@ def main():
 
     # Handle reset
     elif args.command == 'reset':
-        if not Path(args.db_file).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        check_db_path_or_exit(args.db_file)
         with JobDatabase(args.db_file) as db:
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
@@ -970,8 +1019,7 @@ def main():
 
     # Handle recover
     elif args.command == 'recover':
-        if not Path(args.db_file).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        check_db_path_or_exit(args.db_file)
         with JobDatabase(args.db_file) as db:
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
@@ -982,8 +1030,7 @@ def main():
 
     # Handle kill
     elif args.command == 'kill':
-        if not Path(args.db_file).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_file}")
+        check_db_path_or_exit(args.db_file)
         with JobDatabase(args.db_file) as db:
             if not db.table_exists():
                 sys.exit("Error: Database is not initialized. Use 'import' command to create the schema.")
@@ -997,8 +1044,7 @@ def main():
 
     # Handle show
     elif args.command == 'show':
-        if not Path(args.db_path).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_path}")
+        check_db_path_or_exit(args.db_path)
         with JobDatabase(args.db_path, read_only=True) as db:
             job = db.get_job(args.job_id)
             if job is None:
@@ -1009,8 +1055,7 @@ def main():
 
     # Handle list
     elif args.command == 'list':
-        if not Path(args.db_path).exists():
-            sys.exit(f"Error: Database file does not exist: {args.db_path}")
+        check_db_path_or_exit(args.db_path)
         columns = [c.strip() for c in args.columns.split(',') if c.strip()] if args.columns else None
         try:
             with JobDatabase(args.db_path, read_only=True) as db:
